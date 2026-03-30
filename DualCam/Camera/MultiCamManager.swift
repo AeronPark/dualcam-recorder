@@ -134,7 +134,9 @@ class MultiCamManager: NSObject, ObservableObject {
             }
             session.addConnection(portraitConnection)
             portraitMovieOutput = portraitOutput
-            print("✅ Portrait output connected (wide camera, portrait orientation)")
+            print("✅ Portrait output connected")
+            print("   Camera: \(wide.localizedName) (\(wide.deviceType.rawValue))")
+            print("   Port: \(wideVideoPort.sourceDeviceType?.rawValue ?? "nil")")
             
             // === ULTRA-WIDE CAMERA (Landscape 16:9) ===
             let ultraWideInput = try AVCaptureDeviceInput(device: ultraWide)
@@ -168,7 +170,9 @@ class MultiCamManager: NSObject, ObservableObject {
             }
             session.addConnection(landscapeConnection)
             landscapeMovieOutput = landscapeOutput
-            print("✅ Landscape output connected (ultra-wide camera, landscape orientation)")
+            print("✅ Landscape output connected")
+            print("   Camera: \(ultraWide.localizedName) (\(ultraWide.deviceType.rawValue))")
+            print("   Port: \(ultraWideVideoPort.sourceDeviceType?.rawValue ?? "nil")")
             
             // === AUDIO (connect to both outputs) ===
             if let audioDevice = AVCaptureDevice.default(for: .audio),
@@ -325,6 +329,14 @@ class MultiCamManager: NSObject, ObservableObject {
 extension MultiCamManager: AVCaptureFileOutputRecordingDelegate {
     nonisolated func fileOutput(_ output: AVCaptureFileOutput, didStartRecordingTo fileURL: URL, from connections: [AVCaptureConnection]) {
         print("🎬 Started recording: \(fileURL.lastPathComponent)")
+        for (i, conn) in connections.enumerated() {
+            print("   Connection \(i):")
+            print("   - Orientation: \(conn.videoOrientation.rawValue)")
+            print("   - Mirrored: \(conn.isVideoMirrored)")
+            for port in conn.inputPorts {
+                print("   - Port sourceDevice: \(port.sourceDeviceType?.rawValue ?? "nil")")
+            }
+        }
     }
     
     nonisolated func fileOutput(_ output: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL, from connections: [AVCaptureConnection], error: Error?) {
