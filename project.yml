@@ -25,6 +25,12 @@ targets:
       path: DualCam/Info.plist
       properties:
         CFBundleDisplayName: "DualCam"
+        NSCameraUsageDescription: "DualCam needs camera access to record video"
+        NSMicrophoneUsageDescription: "DualCam needs microphone access to record audio"
+        NSPhotoLibraryAddUsageDescription: "DualCam needs photo library access to save recordings"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.dualcam.app

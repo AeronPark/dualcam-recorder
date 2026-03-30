@@ -20,5 +20,17 @@
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>NSCameraUsageDescription</key>
+	<string>DualCam needs camera access to record video</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>DualCam needs microphone access to record audio</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>DualCam needs photo library access to save recordings</string>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
 </dict>
 </plist>
