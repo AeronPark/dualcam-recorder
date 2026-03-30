@@ -19,6 +19,7 @@
 		0A2C6DBF4D5CFE81550CC5E3 /* DualCamApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DualCamApp.swift; sourceTree = "<group>"; };
 		0C12EA6F72E41865AE6BAF59 /* CameraPreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraPreviewView.swift; sourceTree = "<group>"; };
 		95BFE3DA311EE78415B27F20 /* DualCam.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = DualCam.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A6566994138D5E42A6929024 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		CE3E23CD86362EDED8E6C692 /* MultiCamManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultiCamManager.swift; sourceTree = "<group>"; };
 		E675A9F9A5CCC6295FB69E03 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -61,6 +62,7 @@
 			isa = PBXGroup;
 			children = (
 				E675A9F9A5CCC6295FB69E03 /* Assets.xcassets */,
+				A6566994138D5E42A6929024 /* Info.plist */,
 				9BDC61203A891FD86BF80335 /* App */,
 				0173D5773AC55BF92EA10452 /* Camera */,
 				1A58A923D50C5B7A47BABD2B /* Views */,
@@ -158,7 +160,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				INFOPLIST_KEY_CFBundleDisplayName = DualCam;
+				INFOPLIST_FILE = DualCam/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -243,7 +245,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				INFOPLIST_KEY_CFBundleDisplayName = DualCam;
+				INFOPLIST_FILE = DualCam/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",

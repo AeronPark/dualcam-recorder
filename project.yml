@@ -21,7 +21,10 @@ targets:
     platform: iOS
     sources:
       - DualCam
+    info:
+      path: DualCam/Info.plist
+      properties:
+        CFBundleDisplayName: "DualCam"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.dualcam.app
-        INFOPLIST_KEY_CFBundleDisplayName: "DualCam"
