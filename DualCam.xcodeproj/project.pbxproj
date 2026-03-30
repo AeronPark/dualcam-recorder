@@ -18,7 +18,7 @@
 		00A961A5495A7E0332194464 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		0A2C6DBF4D5CFE81550CC5E3 /* DualCamApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DualCamApp.swift; sourceTree = "<group>"; };
 		0C12EA6F72E41865AE6BAF59 /* CameraPreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraPreviewView.swift; sourceTree = "<group>"; };
-		95BFE3DA311EE78415B27F20 /* DualCam.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = DualCam.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		95BFE3DA311EE78415B27F20 /* DualCam.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DualCam.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A6566994138D5E42A6929024 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		CE3E23CD86362EDED8E6C692 /* MultiCamManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultiCamManager.swift; sourceTree = "<group>"; };
 		E675A9F9A5CCC6295FB69E03 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -107,8 +107,6 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1500;
-				TargetAttributes = {
-				};
 			};
 			buildConfigurationList = A6FC45DCD76AC31F24BB9C37 /* Build configuration list for PBXProject "DualCam" */;
 			developmentRegion = en;
@@ -160,6 +158,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = 38DBUJ5TWP;
 				INFOPLIST_FILE = DualCam/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -245,6 +244,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = 38DBUJ5TWP;
 				INFOPLIST_FILE = DualCam/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

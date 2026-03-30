@@ -157,7 +157,7 @@ class MultiCamManager: NSObject, ObservableObject {
             }
             
             let landscapeConnection = AVCaptureConnection(inputPorts: [ultraWideVideoPort], output: landscapeOutput)
-            landscapeConnection.videoOrientation = .landscapeRight
+            landscapeConnection.videoOrientation = .landscapeLeft
             guard session.canAddConnection(landscapeConnection) else {
                 throw NSError(domain: "MultiCam", code: 8, userInfo: [NSLocalizedDescriptionKey: "Cannot add landscape connection"])
             }
@@ -198,7 +198,7 @@ class MultiCamManager: NSObject, ObservableObject {
             let landscapePreview = AVCaptureVideoPreviewLayer(sessionWithNoConnection: session)
             landscapePreview.videoGravity = .resizeAspectFill
             let landscapePreviewConnection = AVCaptureConnection(inputPort: ultraWideVideoPort, videoPreviewLayer: landscapePreview)
-            landscapePreviewConnection.videoOrientation = .landscapeRight
+            landscapePreviewConnection.videoOrientation = .landscapeLeft
             if session.canAddConnection(landscapePreviewConnection) {
                 session.addConnection(landscapePreviewConnection)
                 self.landscapePreviewLayer = landscapePreview
