@@ -157,7 +157,12 @@ class MultiCamManager: NSObject, ObservableObject {
             }
             
             let landscapeConnection = AVCaptureConnection(inputPorts: [ultraWideVideoPort], output: landscapeOutput)
-            landscapeConnection.videoOrientation = .landscapeLeft
+            landscapeConnection.videoOrientation = .landscapeRight
+            // Try to fix horizontal flip
+            if landscapeConnection.isVideoMirroringSupported {
+                landscapeConnection.isVideoMirrored = true
+                print("📷 Landscape mirroring enabled")
+            }
             guard session.canAddConnection(landscapeConnection) else {
                 throw NSError(domain: "MultiCam", code: 8, userInfo: [NSLocalizedDescriptionKey: "Cannot add landscape connection"])
             }
