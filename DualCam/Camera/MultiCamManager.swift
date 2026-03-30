@@ -160,11 +160,11 @@ class MultiCamManager: NSObject, ObservableObject {
             
             let landscapeConnection = AVCaptureConnection(inputPorts: [ultraWideVideoPort], output: landscapeOutput)
             landscapeConnection.videoOrientation = .landscapeRight
-            // Try to fix horizontal flip
+            // DON'T mirror - mirroring was causing issues
             if landscapeConnection.isVideoMirroringSupported {
-                landscapeConnection.isVideoMirrored = true
-                print("📷 Landscape mirroring enabled")
+                landscapeConnection.isVideoMirrored = false
             }
+            print("📷 Landscape connection orientation: .landscapeRight")
             guard session.canAddConnection(landscapeConnection) else {
                 throw NSError(domain: "MultiCam", code: 8, userInfo: [NSLocalizedDescriptionKey: "Cannot add landscape connection"])
             }
@@ -330,8 +330,16 @@ extension MultiCamManager: AVCaptureFileOutputRecordingDelegate {
     nonisolated func fileOutput(_ output: AVCaptureFileOutput, didStartRecordingTo fileURL: URL, from connections: [AVCaptureConnection]) {
         print("🎬 Started recording: \(fileURL.lastPathComponent)")
         for (i, conn) in connections.enumerated() {
+            let orientationName: String
+            switch conn.videoOrientation {
+            case .portrait: orientationName = "portrait"
+            case .portraitUpsideDown: orientationName = "portraitUpsideDown"
+            case .landscapeRight: orientationName = "landscapeRight"
+            case .landscapeLeft: orientationName = "landscapeLeft"
+            @unknown default: orientationName = "unknown(\(conn.videoOrientation.rawValue))"
+            }
             print("   Connection \(i):")
-            print("   - Orientation: \(conn.videoOrientation.rawValue)")
+            print("   - Orientation: \(orientationName)")
             print("   - Mirrored: \(conn.isVideoMirrored)")
             for port in conn.inputPorts {
                 print("   - Port sourceDevice: \(port.sourceDeviceType?.rawValue ?? "nil")")
@@ -346,6 +354,19 @@ extension MultiCamManager: AVCaptureFileOutputRecordingDelegate {
             print("❌ Recording error for \(name): \(error.localizedDescription)")
         } else {
             print("✅ Finished recording: \(name)")
+            
+            // Log actual video dimensions from the file
+            let asset = AVAsset(url: outputFileURL)
+            Task {
+                if let track = try? await asset.loadTracks(withMediaType: .video).first {
+                    let size = try? await track.load(.naturalSize)
+                    let transform = try? await track.load(.preferredTransform)
+                    print("📐 \(name) actual size: \(size?.width ?? 0) x \(size?.height ?? 0)")
+                    if let t = transform {
+                        print("📐 \(name) transform: a=\(t.a) b=\(t.b) c=\(t.c) d=\(t.d)")
+                    }
+                }
+            }
         }
         
         Task { @MainActor in
