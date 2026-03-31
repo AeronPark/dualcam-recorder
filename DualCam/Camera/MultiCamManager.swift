@@ -1375,7 +1375,7 @@ extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptu
             let faceHeight = CGFloat(CVPixelBufferGetHeight(faceBuffer))
             
             // PiP size: 1/4 of output width
-            let pipWidth: CGFloat = outputWidth * 0.28
+            let pipWidth: CGFloat = outputWidth * 0.35  // 35% of frame width
             let pipHeight = pipWidth * (faceHeight / faceWidth)
             
             // Scale face cam to PiP size
