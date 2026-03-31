@@ -1,7 +1,6 @@
 import AVFoundation
 import Photos
 import SwiftUI
-import CoreImage
 
 /// MultiCamManager - Records portrait (9:16) and landscape (16:9) simultaneously
 /// Portrait: MovieFileOutput from wide camera (simple)
@@ -37,11 +36,9 @@ class MultiCamManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var landscapeWriter: AVAssetWriter?
     private nonisolated(unsafe) var landscapeVideoInput: AVAssetWriterInput?
     private nonisolated(unsafe) var landscapeAudioInput: AVAssetWriterInput?
-    private nonisolated(unsafe) var landscapePixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private nonisolated(unsafe) var landscapeURL: URL?
     private nonisolated(unsafe) var landscapeWritingStarted = false
     private nonisolated(unsafe) var landscapeSessionStartTime: CMTime?
-    private nonisolated(unsafe) var ciContext: CIContext?
     
     private var landscapeFinished = false
     
@@ -176,9 +173,9 @@ class MultiCamManager: NSObject, ObservableObject {
                 throw NSError(domain: "MultiCam", code: 7, userInfo: [NSLocalizedDescriptionKey: "No ultra-wide camera port"])
             }
             
-            // Capture in PORTRAIT orientation - we'll crop for landscape content
+            // Capture in LANDSCAPE orientation - frames come out as 1920x1080
             let landscapeVideoConnection = AVCaptureConnection(inputPorts: [ultraWideVideoPort], output: videoOutput)
-            landscapeVideoConnection.videoOrientation = .portrait
+            landscapeVideoConnection.videoOrientation = .landscapeRight
             guard session.canAddConnection(landscapeVideoConnection) else {
                 throw NSError(domain: "MultiCam", code: 8, userInfo: [NSLocalizedDescriptionKey: "Cannot add landscape video connection"])
             }
@@ -247,11 +244,6 @@ class MultiCamManager: NSObject, ObservableObject {
         session.commitConfiguration()
         multiCamSession = session
         
-        // Initialize CIContext for image processing
-        writerLock.lock()
-        ciContext = CIContext(options: [.useSoftwareRenderer: false])
-        writerLock.unlock()
-        
         print("🎬 MultiCam session configured, starting...")
         
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -307,25 +299,10 @@ class MultiCamManager: NSObject, ObservableObject {
         do {
             let writer = try AVAssetWriter(url: url, fileType: .mov)
             
-            // Video input - 1920x1080 landscape
-            let videoSettings: [String: Any] = [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: 1920,
-                AVVideoHeightKey: 1080
-            ]
-            let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            // Video input - passthrough (no re-encoding, write frames directly)
+            // Use nil outputSettings for passthrough
+            let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
             videoInput.expectsMediaDataInRealTime = true
-            
-            // Pixel buffer adaptor for writing cropped frames
-            let pixelBufferAttributes: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                kCVPixelBufferWidthKey as String: 1920,
-                kCVPixelBufferHeightKey as String: 1080
-            ]
-            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-                assetWriterInput: videoInput,
-                sourcePixelBufferAttributes: pixelBufferAttributes
-            )
             
             // Audio input
             let audioSettings: [String: Any] = [
@@ -346,11 +323,10 @@ class MultiCamManager: NSObject, ObservableObject {
             landscapeWriter = writer
             landscapeVideoInput = videoInput
             landscapeAudioInput = audioInput
-            landscapePixelBufferAdaptor = adaptor
             landscapeWritingStarted = false
             landscapeSessionStartTime = nil
             
-            print("✅ Landscape AssetWriter configured for 1920x1080")
+            print("✅ Landscape AssetWriter configured (passthrough)")
             
         } catch {
             print("❌ Failed to create landscape writer: \(error)")
@@ -413,7 +389,6 @@ class MultiCamManager: NSObject, ObservableObject {
             self.landscapeWriter = nil
             self.landscapeVideoInput = nil
             self.landscapeAudioInput = nil
-            self.landscapePixelBufferAdaptor = nil
             self.landscapeWritingStarted = false
             self.landscapeSessionStartTime = nil
             self.writerLock.unlock()
@@ -490,15 +465,13 @@ extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptu
         }
     }
     
-    /// Process ultra-wide camera frames: crop center horizontal strip (16:9), scale to 1920x1080
+    /// Process ultra-wide camera frames: write directly (frames already landscape from videoOrientation)
     nonisolated private func processLandscapeVideoFrame(_ sampleBuffer: CMSampleBuffer, timestamp: CMTime) {
         writerLock.lock()
         defer { writerLock.unlock() }
         
         guard let writer = landscapeWriter,
               let videoInput = landscapeVideoInput,
-              let adaptor = landscapePixelBufferAdaptor,
-              let context = ciContext,
               let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
             return
         }
@@ -512,43 +485,15 @@ extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptu
             
             let w = CVPixelBufferGetWidth(imageBuffer)
             let h = CVPixelBufferGetHeight(imageBuffer)
-            print("📐 Landscape source frame: \(w) x \(h) (portrait)")
-            print("📐 Will crop center 16:9 strip and scale to 1920x1080 (no rotation)")
+            print("📐 Landscape frame dimensions: \(w) x \(h)")
+            print("📐 Writing directly (no cropping)")
         }
         
         guard writer.status == .writing, videoInput.isReadyForMoreMediaData else { return }
         
-        // Frame is portrait: e.g., 1080w x 1920h
-        let frameWidth = CGFloat(CVPixelBufferGetWidth(imageBuffer))
-        let frameHeight = CGFloat(CVPixelBufferGetHeight(imageBuffer))
-        
-        // Crop a horizontal strip from center
-        // Strip dimensions: frameWidth x (frameWidth * 9/16) = 1080 x 607.5
-        // This is already 16:9 aspect ratio (wider than tall)
-        let cropHeight = frameWidth * 9.0 / 16.0
-        let cropY = (frameHeight - cropHeight) / 2.0
-        let cropRect = CGRect(x: 0, y: cropY, width: frameWidth, height: cropHeight)
-        
-        // Crop
-        var ciImage = CIImage(cvPixelBuffer: imageBuffer)
-        ciImage = ciImage.cropped(to: cropRect)
-        
-        // Translate origin to (0,0)
-        ciImage = ciImage.transformed(by: CGAffineTransform(translationX: 0, y: -cropY))
-        
-        // Scale from 1080x607.5 to 1920x1080 (no rotation needed - already landscape aspect)
-        let scaleX = 1920.0 / frameWidth
-        let scaleY = 1080.0 / cropHeight
-        ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
-        
-        // Render to pixel buffer
-        guard let pixelBufferPool = adaptor.pixelBufferPool else { return }
-        var newPixelBuffer: CVPixelBuffer?
-        CVPixelBufferPoolCreatePixelBuffer(nil, pixelBufferPool, &newPixelBuffer)
-        
-        guard let outputBuffer = newPixelBuffer else { return }
-        context.render(ciImage, to: outputBuffer)
-        adaptor.append(outputBuffer, withPresentationTime: timestamp)
+        // Frames should already be landscape (1920x1080) from videoOrientation = .landscapeRight
+        // Write directly using sample buffer
+        videoInput.append(sampleBuffer)
     }
     
     nonisolated private func processLandscapeAudioFrame(_ sampleBuffer: CMSampleBuffer, timestamp: CMTime) {
