@@ -176,9 +176,9 @@ class MultiCamManager: NSObject, ObservableObject {
                 throw NSError(domain: "MultiCam", code: 7, userInfo: [NSLocalizedDescriptionKey: "No ultra-wide camera port"])
             }
             
-            // Capture in LANDSCAPE orientation - ultra-wide has enough FOV
+            // Capture in PORTRAIT orientation - we'll crop a 16:9 horizontal strip
             let landscapeVideoConnection = AVCaptureConnection(inputPorts: [ultraWideVideoPort], output: videoOutput)
-            landscapeVideoConnection.videoOrientation = .landscapeRight
+            landscapeVideoConnection.videoOrientation = .portrait
             guard session.canAddConnection(landscapeVideoConnection) else {
                 throw NSError(domain: "MultiCam", code: 8, userInfo: [NSLocalizedDescriptionKey: "Cannot add landscape video connection"])
             }
@@ -488,7 +488,8 @@ extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptu
         }
     }
     
-    /// Process ultra-wide camera frames - apply orientation from CIImage
+    /// Process ultra-wide camera frames: crop center horizontal strip (16:9) for landscape
+    /// Ultra-wide has enough horizontal FOV that a center crop gives proper landscape content
     nonisolated private func processLandscapeVideoFrame(_ sampleBuffer: CMSampleBuffer, timestamp: CMTime) {
         writerLock.lock()
         defer { writerLock.unlock() }
@@ -504,6 +505,11 @@ extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptu
         let frameWidth = CGFloat(CVPixelBufferGetWidth(imageBuffer))
         let frameHeight = CGFloat(CVPixelBufferGetHeight(imageBuffer))
         
+        // Calculate crop: take horizontal strip from center
+        // Strip has 16:9 aspect ratio: height = width * 9/16
+        let cropHeight = frameWidth * 9.0 / 16.0
+        let cropY = (frameHeight - cropHeight) / 2.0
+        
         // Start writer on first frame
         if !landscapeWritingStarted {
             landscapeWritingStarted = true
@@ -511,33 +517,28 @@ extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptu
             writer.startWriting()
             writer.startSession(atSourceTime: timestamp)
             
-            print("📐 Landscape raw frame: \(Int(frameWidth)) x \(Int(frameHeight))")
+            print("📐 Ultra-wide portrait frame: \(Int(frameWidth)) x \(Int(frameHeight))")
+            print("📐 Cropping center strip: \(Int(frameWidth)) x \(Int(cropHeight)) (16:9)")
+            print("📐 Crop Y offset: \(Int(cropY)) (cutting top/bottom)")
+            print("📐 Output: 1920 x 1080")
         }
         
         guard writer.status == .writing, videoInput.isReadyForMoreMediaData else { return }
         
-        // Create CIImage with orientation applied
-        // .oriented(.right) rotates 90° CW - landscape right from portrait
+        // Create CIImage and crop the center horizontal strip
         var ciImage = CIImage(cvPixelBuffer: imageBuffer)
-        ciImage = ciImage.oriented(.right)  // Apply landscapeRight orientation
         
-        // Get the oriented extent
-        let extent = ciImage.extent
+        // Crop rectangle (CIImage origin is bottom-left)
+        let cropRect = CGRect(x: 0, y: cropY, width: frameWidth, height: cropHeight)
+        ciImage = ciImage.cropped(to: cropRect)
         
-        // Log once
-        if timestamp.seconds < (landscapeSessionStartTime?.seconds ?? 0) + 0.1 {
-            print("📐 After orientation: \(Int(extent.width)) x \(Int(extent.height))")
-        }
+        // Translate origin to (0,0)
+        ciImage = ciImage.transformed(by: CGAffineTransform(translationX: 0, y: -cropY))
         
-        // Scale to 1920x1080
-        let scaleX = 1920.0 / extent.width
-        let scaleY = 1080.0 / extent.height
+        // Scale to 1920x1080 (NO ROTATION - crop is already landscape aspect)
+        let scaleX = 1920.0 / frameWidth
+        let scaleY = 1080.0 / cropHeight
         ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
-        
-        // Translate to origin if needed (oriented images can have non-zero origin)
-        if ciImage.extent.origin != .zero {
-            ciImage = ciImage.transformed(by: CGAffineTransform(translationX: -ciImage.extent.origin.x, y: -ciImage.extent.origin.y))
-        }
         
         // Render to pixel buffer
         guard let pixelBufferPool = adaptor.pixelBufferPool else {
