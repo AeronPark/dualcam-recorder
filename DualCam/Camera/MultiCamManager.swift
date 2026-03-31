@@ -581,6 +581,7 @@ class MultiCamManager: NSObject, ObservableObject {
             // Set these AFTER adding connection
             faceCamConnection.videoOrientation = .portrait
             if faceCamConnection.isVideoMirroringSupported {
+                faceCamConnection.automaticallyAdjustsVideoMirroring = false
                 faceCamConnection.isVideoMirrored = true  // Mirror front camera like a selfie
             }
             faceCamVideoOutput = faceCamOutput
@@ -627,6 +628,7 @@ class MultiCamManager: NSObject, ObservableObject {
                 // Set these AFTER adding connection
                 faceCamPreviewConnection.videoOrientation = .portrait
                 if faceCamPreviewConnection.isVideoMirroringSupported {
+                    faceCamPreviewConnection.automaticallyAdjustsVideoMirroring = false
                     faceCamPreviewConnection.isVideoMirrored = true
                 }
                 self.faceCamPreviewLayer = faceCamPreview
