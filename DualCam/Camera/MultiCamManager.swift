@@ -488,7 +488,8 @@ extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptu
         }
     }
     
-    /// Process ultra-wide camera frames: rotate portrait to landscape using Core Image
+    /// Process ultra-wide camera frames: crop center horizontal strip for landscape
+    /// This takes a 16:9 "letterbox" from the middle of the portrait frame
     nonisolated private func processLandscapeVideoFrame(_ sampleBuffer: CMSampleBuffer, timestamp: CMTime) {
         writerLock.lock()
         defer { writerLock.unlock() }
@@ -511,28 +512,35 @@ extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptu
             writer.startWriting()
             writer.startSession(atSourceTime: timestamp)
             
+            // Calculate crop dimensions
+            let cropHeight = frameWidth * 9.0 / 16.0
             print("📐 Landscape source frame: \(Int(frameWidth)) x \(Int(frameHeight)) (portrait)")
-            print("📐 Will rotate 90° CCW to make landscape")
+            print("📐 Cropping center strip: \(Int(frameWidth)) x \(Int(cropHeight)) (16:9)")
+            print("📐 Scaling to: 1920 x 1080")
         }
         
         guard writer.status == .writing, videoInput.isReadyForMoreMediaData else { return }
         
-        // Create CIImage from pixel buffer
+        // Portrait frame: e.g., 1080w x 1920h
+        // Crop a horizontal strip from center that has 16:9 aspect ratio
+        // Strip height = width * 9/16 = 1080 * 9/16 = 607.5
+        let cropHeight = frameWidth * 9.0 / 16.0
+        let cropY = (frameHeight - cropHeight) / 2.0
+        
+        // Crop rectangle in CIImage coordinates (origin bottom-left)
+        let cropRect = CGRect(x: 0, y: cropY, width: frameWidth, height: cropHeight)
+        
+        // Create and crop
         var ciImage = CIImage(cvPixelBuffer: imageBuffer)
+        ciImage = ciImage.cropped(to: cropRect)
         
-        // Rotate 90° counter-clockwise to convert portrait to landscape
-        // CCW rotation: (x, y) -> (y, width - x)
-        // 1. Rotate -90° (CCW)
-        ciImage = ciImage.transformed(by: CGAffineTransform(rotationAngle: -.pi / 2))
+        // Move origin to (0,0)
+        ciImage = ciImage.transformed(by: CGAffineTransform(translationX: 0, y: -cropY))
         
-        // After rotation, image origin is negative. Translate to fix.
-        // Rotated dimensions: height x width (e.g., 1920 x 1080)
-        ciImage = ciImage.transformed(by: CGAffineTransform(translationX: 0, y: frameWidth))
-        
-        // Now image is frameHeight x frameWidth (e.g., 1920 x 1080)
-        // Scale to exactly 1920 x 1080
-        let scaleX = 1920.0 / frameHeight
-        let scaleY = 1080.0 / frameWidth
+        // Scale from 1080x607 to 1920x1080
+        // NO ROTATION - the cropped strip is already landscape oriented (wider than tall)
+        let scaleX = 1920.0 / frameWidth
+        let scaleY = 1080.0 / cropHeight
         ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
         
         // Render to pixel buffer
