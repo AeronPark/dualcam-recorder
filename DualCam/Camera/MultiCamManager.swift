@@ -5,13 +5,22 @@ import CoreImage
 
 // MARK: - Recording Mode
 enum RecordingMode: String, CaseIterable {
+    case singleLens = "Single Lens"
     case dualLens = "Dual Lens"
     case streamer = "Streamer"
     
     var description: String {
         switch self {
-        case .dualLens: return "Two separate videos (portrait + landscape)"
-        case .streamer: return "One video with face cam PiP"
+        case .singleLens: return "One camera, crops for both outputs"
+        case .dualLens: return "Two cameras, full quality both"
+        case .streamer: return "Main + face cam PiP"
+        }
+    }
+    
+    var requiresMultiCam: Bool {
+        switch self {
+        case .singleLens: return false
+        case .dualLens, .streamer: return true
         }
     }
 }
@@ -32,6 +41,7 @@ class MultiCamManager: NSObject, ObservableObject {
     
     // MARK: - Session & Devices
     private var multiCamSession: AVCaptureMultiCamSession?
+    private var singleLensSession: AVCaptureSession?  // For single lens fallback
     private var wideCamera: AVCaptureDevice?      // For portrait (9:16) / main view
     private var ultraWideCamera: AVCaptureDevice? // For landscape (16:9)
     private var frontCamera: AVCaptureDevice?     // For streamer face cam
@@ -59,6 +69,14 @@ class MultiCamManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var ciContext: CIContext?
     
     private var landscapeFinished = false
+    
+    // Portrait writer for single lens mode
+    private nonisolated(unsafe) var portraitWriter: AVAssetWriter?
+    private nonisolated(unsafe) var portraitVideoInput: AVAssetWriterInput?
+    private nonisolated(unsafe) var portraitAudioInput: AVAssetWriterInput?
+    private nonisolated(unsafe) var portraitPixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private nonisolated(unsafe) var portraitWritingStarted = false
+    private nonisolated(unsafe) var isSingleLensMode = false
     
     // MARK: - Streamer Mode State
     private nonisolated(unsafe) var mainVideoOutput: AVCaptureVideoDataOutput?
@@ -161,7 +179,15 @@ class MultiCamManager: NSObject, ObservableObject {
     }
     
     private func setupSession() {
+        // Check if multi-cam is needed but not supported
+        if recordingMode.requiresMultiCam && !AVCaptureMultiCamSession.isMultiCamSupported {
+            print("⚠️ Multi-cam not supported, falling back to Single Lens")
+            recordingMode = .singleLens
+        }
+        
         switch recordingMode {
+        case .singleLens:
+            setupSingleLensSession()
         case .dualLens:
             setupMultiCamSession()
         case .streamer:
@@ -172,6 +198,8 @@ class MultiCamManager: NSObject, ObservableObject {
     private func stopSession() {
         multiCamSession?.stopRunning()
         multiCamSession = nil
+        singleLensSession?.stopRunning()
+        singleLensSession = nil
         portraitPreviewLayer = nil
         landscapePreviewLayer = nil
         faceCamPreviewLayer = nil
@@ -182,6 +210,92 @@ class MultiCamManager: NSObject, ObservableObject {
         faceCamVideoOutput = nil
         streamerAudioOutput = nil
         isSessionRunning = false
+    }
+    
+    // MARK: - Single Lens Session Setup (fallback for older phones)
+    private func setupSingleLensSession() {
+        guard let wide = wideCamera else {
+            errorMessage = "Camera not available"
+            print("❌ Wide camera not found")
+            return
+        }
+        
+        print("🎬 Setting up Single Lens session (one camera, crop for landscape)...")
+        
+        let session = AVCaptureSession()
+        session.beginConfiguration()
+        session.sessionPreset = .hd1920x1080
+        
+        do {
+            // Wide camera input
+            let wideInput = try AVCaptureDeviceInput(device: wide)
+            guard session.canAddInput(wideInput) else {
+                throw NSError(domain: "SingleLens", code: 1, userInfo: [NSLocalizedDescriptionKey: "Cannot add camera input"])
+            }
+            session.addInput(wideInput)
+            print("✅ Wide camera input added")
+            
+            // Video data output (we'll process frames for both portrait and landscape)
+            let videoOutput = AVCaptureVideoDataOutput()
+            videoOutput.setSampleBufferDelegate(self, queue: landscapeQueue)
+            videoOutput.videoSettings = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            ]
+            guard session.canAddOutput(videoOutput) else {
+                throw NSError(domain: "SingleLens", code: 2, userInfo: [NSLocalizedDescriptionKey: "Cannot add video output"])
+            }
+            session.addOutput(videoOutput)
+            
+            if let connection = videoOutput.connection(with: .video) {
+                connection.videoOrientation = .portrait
+            }
+            landscapeVideoOutput = videoOutput  // Reuse for single lens
+            print("✅ Video output added (portrait capture)")
+            
+            // Audio input
+            if let audioDevice = AVCaptureDevice.default(for: .audio),
+               let audioInput = try? AVCaptureDeviceInput(device: audioDevice) {
+                if session.canAddInput(audioInput) {
+                    session.addInput(audioInput)
+                    
+                    let audioOutput = AVCaptureAudioDataOutput()
+                    audioOutput.setSampleBufferDelegate(self, queue: audioQueue)
+                    if session.canAddOutput(audioOutput) {
+                        session.addOutput(audioOutput)
+                        landscapeAudioOutput = audioOutput
+                        print("✅ Audio output added")
+                    }
+                }
+            }
+            
+            // Preview layer
+            let preview = AVCaptureVideoPreviewLayer(session: session)
+            preview.videoGravity = .resizeAspectFill
+            self.portraitPreviewLayer = preview
+            print("✅ Preview layer created")
+            
+        } catch {
+            print("❌ Single lens setup failed: \(error.localizedDescription)")
+            errorMessage = error.localizedDescription
+            session.commitConfiguration()
+            return
+        }
+        
+        session.commitConfiguration()
+        
+        // Store as regular session (not multi-cam)
+        // We need to handle this differently
+        singleLensSession = session
+        
+        print("🎬 Single Lens session configured, starting...")
+        
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            session.startRunning()
+            DispatchQueue.main.async {
+                self?.isSessionRunning = session.isRunning
+                print("🎬 Single Lens session running: \(session.isRunning)")
+            }
+        }
     }
     
     // MARK: - MultiCam Session Setup
@@ -493,6 +607,8 @@ class MultiCamManager: NSObject, ObservableObject {
         let timestamp = Int(Date().timeIntervalSince1970)
         
         switch recordingMode {
+        case .singleLens:
+            startSingleLensRecording(tempDir: tempDir, timestamp: timestamp)
         case .dualLens:
             startDualLensRecording(tempDir: tempDir, timestamp: timestamp)
         case .streamer:
@@ -502,6 +618,94 @@ class MultiCamManager: NSObject, ObservableObject {
         isRecording = true
         recordingStartTime = Date()
         startTimer()
+    }
+    
+    private func startSingleLensRecording(tempDir: URL, timestamp: Int) {
+        // Portrait writer - full frame
+        setupPortraitWriter(tempDir: tempDir, timestamp: timestamp)
+        portraitFinished = false
+        
+        // Landscape writer - cropped
+        setupLandscapeWriter(tempDir: tempDir, timestamp: timestamp)
+        landscapeFinished = false
+        
+        // Enable single lens processing mode
+        writerLock.lock()
+        isSingleLensMode = true
+        writerLock.unlock()
+        
+        print("🔴 Starting single lens recording (portrait + landscape from one camera)...")
+        
+        writerLock.lock()
+        if let pUrl = portraitURL {
+            print("   Portrait: \(pUrl.lastPathComponent)")
+        }
+        if let lUrl = landscapeURL {
+            print("   Landscape: \(lUrl.lastPathComponent)")
+        }
+        writerLock.unlock()
+    }
+    
+    private func setupPortraitWriter(tempDir: URL, timestamp: Int) {
+        writerLock.lock()
+        defer { writerLock.unlock() }
+        
+        let url = tempDir.appendingPathComponent("portrait_\(timestamp).mov")
+        portraitURL = url
+        
+        do {
+            let writer = try AVAssetWriter(url: url, fileType: .mov)
+            
+            // Video input - 1080x1920 portrait
+            let videoSettings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: 1080,
+                AVVideoHeightKey: 1920
+            ]
+            let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            videoInput.expectsMediaDataInRealTime = true
+            
+            let pixelBufferAttributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: 1080,
+                kCVPixelBufferHeightKey as String: 1920
+            ]
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: videoInput,
+                sourcePixelBufferAttributes: pixelBufferAttributes
+            )
+            
+            // Audio input
+            let audioSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 44100,
+                AVNumberOfChannelsKey: 2
+            ]
+            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+            audioInput.expectsMediaDataInRealTime = true
+            
+            if writer.canAdd(videoInput) {
+                writer.add(videoInput)
+            }
+            if writer.canAdd(audioInput) {
+                writer.add(audioInput)
+            }
+            
+            portraitWriter = writer
+            portraitVideoInput = videoInput
+            portraitAudioInput = audioInput
+            portraitPixelBufferAdaptor = adaptor
+            portraitWritingStarted = false
+            
+            if ciContext == nil {
+                ciContext = CIContext(options: [.useSoftwareRenderer: false])
+            }
+            
+            print("✅ Portrait writer configured (1080x1920)")
+            
+        } catch {
+            print("❌ Failed to create portrait writer: \(error)")
+        }
     }
     
     private func startDualLensRecording(tempDir: URL, timestamp: Int) {
@@ -671,6 +875,9 @@ class MultiCamManager: NSObject, ObservableObject {
         print("⏹ Stopping recording...")
         
         switch recordingMode {
+        case .singleLens:
+            finishPortraitWriter()
+            finishLandscapeWriter()
         case .dualLens:
             portraitMovieOutput?.stopRecording()
             finishLandscapeWriter()
@@ -741,6 +948,58 @@ class MultiCamManager: NSObject, ObservableObject {
         guard let url = url else { return }
         
         saveToPhotos(url: url, name: "Streamer")
+    }
+    
+    private func finishPortraitWriter() {
+        landscapeQueue.async { [weak self] in
+            guard let self = self else { return }
+            
+            self.writerLock.lock()
+            
+            self.portraitVideoInput?.markAsFinished()
+            self.portraitAudioInput?.markAsFinished()
+            
+            guard let writer = self.portraitWriter, writer.status == .writing else {
+                self.writerLock.unlock()
+                Task { @MainActor in
+                    self.portraitFinished = true
+                    self.checkAndSaveRecordings()
+                }
+                return
+            }
+            
+            let url = self.portraitURL
+            self.writerLock.unlock()
+            
+            writer.finishWriting {
+                print("✅ Finished portrait recording")
+                
+                if let url = url {
+                    let asset = AVAsset(url: url)
+                    Task {
+                        if let track = try? await asset.loadTracks(withMediaType: .video).first {
+                            let size = try? await track.load(.naturalSize)
+                            print("📐 Portrait actual size: \(size?.width ?? 0) x \(size?.height ?? 0)")
+                        }
+                    }
+                }
+                
+                Task { @MainActor in
+                    self.portraitFinished = true
+                    self.checkAndSaveRecordings()
+                }
+            }
+            
+            // Cleanup
+            self.writerLock.lock()
+            self.portraitWriter = nil
+            self.portraitVideoInput = nil
+            self.portraitAudioInput = nil
+            self.portraitPixelBufferAdaptor = nil
+            self.portraitWritingStarted = false
+            self.isSingleLensMode = false
+            self.writerLock.unlock()
+        }
     }
     
     private func finishLandscapeWriter() {
@@ -848,7 +1107,7 @@ class MultiCamManager: NSObject, ObservableObject {
     
     // MARK: - Session Access
     func getSession() -> AVCaptureSession? {
-        return multiCamSession
+        return multiCamSession ?? singleLensSession
     }
 }
 
@@ -868,7 +1127,15 @@ extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptu
             let isFaceCamOutput = (output === faceCamVideoOutput)
             writerLock.unlock()
             
-            if isLandscapeOutput {
+            // Check for single lens mode first
+            writerLock.lock()
+            let singleLens = isSingleLensMode
+            writerLock.unlock()
+            
+            if singleLens && isLandscapeOutput {
+                // Single lens: process same frame for both outputs
+                processSingleLensVideoFrame(sampleBuffer, timestamp: timestamp)
+            } else if isLandscapeOutput {
                 processLandscapeVideoFrame(sampleBuffer, timestamp: timestamp)
             } else if isFaceCamOutput {
                 processFaceCamFrame(sampleBuffer)
@@ -881,11 +1148,110 @@ extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptu
             let isStreamerAudio = (output === streamerAudioOutput)
             writerLock.unlock()
             
-            if isLandscapeAudio {
+            // Check for single lens mode
+            writerLock.lock()
+            let singleLens = isSingleLensMode
+            writerLock.unlock()
+            
+            if singleLens && isLandscapeAudio {
+                processSingleLensAudioFrame(sampleBuffer, timestamp: timestamp)
+            } else if isLandscapeAudio {
                 processLandscapeAudioFrame(sampleBuffer, timestamp: timestamp)
             } else if isStreamerAudio {
                 processStreamerAudioFrame(sampleBuffer, timestamp: timestamp)
             }
+        }
+    }
+    
+    // MARK: - Single Lens Processing (write to both portrait and landscape)
+    nonisolated private func processSingleLensVideoFrame(_ sampleBuffer: CMSampleBuffer, timestamp: CMTime) {
+        writerLock.lock()
+        defer { writerLock.unlock() }
+        
+        guard let context = ciContext,
+              let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            return
+        }
+        
+        let frameWidth = CGFloat(CVPixelBufferGetWidth(imageBuffer))
+        let frameHeight = CGFloat(CVPixelBufferGetHeight(imageBuffer))
+        
+        // Start writers on first frame
+        if !portraitWritingStarted {
+            portraitWritingStarted = true
+            landscapeWritingStarted = true
+            landscapeSessionStartTime = timestamp
+            
+            portraitWriter?.startWriting()
+            portraitWriter?.startSession(atSourceTime: timestamp)
+            landscapeWriter?.startWriting()
+            landscapeWriter?.startSession(atSourceTime: timestamp)
+            
+            let cropHeight = frameWidth * 9.0 / 16.0
+            print("📐 Single Lens frame: \(Int(frameWidth)) x \(Int(frameHeight))")
+            print("📐 Portrait: full frame scaled to 1080x1920")
+            print("📐 Landscape: center crop \(Int(frameWidth)) x \(Int(cropHeight)) → 1920x1080")
+        }
+        
+        let ciImage = CIImage(cvPixelBuffer: imageBuffer)
+        
+        // === PORTRAIT: Full frame scaled to 1080x1920 ===
+        if let portraitInput = portraitVideoInput,
+           let portraitAdaptor = portraitPixelBufferAdaptor,
+           portraitInput.isReadyForMoreMediaData,
+           let portraitPool = portraitAdaptor.pixelBufferPool {
+            
+            let scaleX = 1080.0 / frameWidth
+            let scaleY = 1920.0 / frameHeight
+            let portraitImage = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+            
+            var portraitBuffer: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, portraitPool, &portraitBuffer)
+            if let buffer = portraitBuffer {
+                context.render(portraitImage, to: buffer)
+                portraitAdaptor.append(buffer, withPresentationTime: timestamp)
+            }
+        }
+        
+        // === LANDSCAPE: Center crop to 16:9, scale to 1920x1080 ===
+        if let landscapeInput = landscapeVideoInput,
+           let landscapeAdaptor = landscapePixelBufferAdaptor,
+           landscapeInput.isReadyForMoreMediaData,
+           let landscapePool = landscapeAdaptor.pixelBufferPool {
+            
+            let cropHeight = frameWidth * 9.0 / 16.0
+            let cropY = (frameHeight - cropHeight) / 2.0
+            let cropRect = CGRect(x: 0, y: cropY, width: frameWidth, height: cropHeight)
+            
+            var landscapeImage = ciImage.cropped(to: cropRect)
+            landscapeImage = landscapeImage.transformed(by: CGAffineTransform(translationX: 0, y: -cropY))
+            
+            let scaleX = 1920.0 / frameWidth
+            let scaleY = 1080.0 / cropHeight
+            landscapeImage = landscapeImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+            
+            var landscapeBuffer: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, landscapePool, &landscapeBuffer)
+            if let buffer = landscapeBuffer {
+                context.render(landscapeImage, to: buffer)
+                landscapeAdaptor.append(buffer, withPresentationTime: timestamp)
+            }
+        }
+    }
+    
+    // MARK: - Single Lens Audio Processing
+    nonisolated private func processSingleLensAudioFrame(_ sampleBuffer: CMSampleBuffer, timestamp: CMTime) {
+        writerLock.lock()
+        defer { writerLock.unlock() }
+        
+        guard portraitWritingStarted else { return }
+        
+        // Write to both outputs
+        if let portraitAudio = portraitAudioInput, portraitAudio.isReadyForMoreMediaData {
+            portraitAudio.append(sampleBuffer)
+        }
+        if let landscapeAudio = landscapeAudioInput, landscapeAudio.isReadyForMoreMediaData {
+            landscapeAudio.append(sampleBuffer)
         }
     }
     
