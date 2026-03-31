@@ -94,7 +94,7 @@ class MultiCamManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var streamerWritingStarted = false
     private nonisolated(unsafe) var streamerSessionStartTime: CMTime?
     private nonisolated(unsafe) var latestFaceCamBuffer: CVPixelBuffer?
-    private nonisolated(unsafe) var faceCamLock = NSLock()
+    private let faceCamLock = NSLock()
     
     // MARK: - Recording State
     private var recordingTimer: Timer?
@@ -173,9 +173,46 @@ class MultiCamManager: NSObject, ObservableObject {
     // MARK: - Mode Switching
     func switchMode(to mode: RecordingMode) {
         guard !isRecording else { return }
+        guard recordingMode != mode else { return }  // No change needed
+        
+        print("🔄 Switching from \(recordingMode.rawValue) to \(mode.rawValue)")
         recordingMode = mode
-        stopSession()
-        setupSession()
+        isSessionRunning = false
+        
+        // Stop on background thread, then setup new session
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.stopSessionSync()
+            
+            // Small delay to ensure cleanup
+            Thread.sleep(forTimeInterval: 0.2)
+            
+            DispatchQueue.main.async {
+                self?.setupSession()
+            }
+        }
+    }
+    
+    private func stopSessionSync() {
+        multiCamSession?.stopRunning()
+        singleLensSession?.stopRunning()
+        
+        DispatchQueue.main.async { [weak self] in
+            self?.multiCamSession = nil
+            self?.singleLensSession = nil
+            self?.portraitPreviewLayer = nil
+            self?.landscapePreviewLayer = nil
+            self?.faceCamPreviewLayer = nil
+            self?.portraitMovieOutput = nil
+        }
+        
+        writerLock.lock()
+        landscapeVideoOutput = nil
+        landscapeAudioOutput = nil
+        mainVideoOutput = nil
+        faceCamVideoOutput = nil
+        streamerAudioOutput = nil
+        latestFaceCamBuffer = nil
+        writerLock.unlock()
     }
     
     private func setupSession() {
@@ -455,13 +492,23 @@ class MultiCamManager: NSObject, ObservableObject {
     private func setupStreamerSession() {
         guard AVCaptureMultiCamSession.isMultiCamSupported else {
             errorMessage = "Multi-cam not supported on this device"
-            print("❌ Multi-cam not supported")
+            print("❌ Multi-cam not supported, falling back to Single Lens")
+            recordingMode = .singleLens
+            setupSingleLensSession()
             return
+        }
+        
+        // Re-discover cameras if needed
+        if frontCamera == nil {
+            discoverCameras()
         }
         
         guard let wide = wideCamera, let front = frontCamera else {
             errorMessage = "Required cameras not available"
             print("❌ Missing cameras - wide: \(wideCamera != nil), front: \(frontCamera != nil)")
+            print("⚠️ Falling back to Single Lens")
+            recordingMode = .singleLens
+            setupSingleLensSession()
             return
         }
         
