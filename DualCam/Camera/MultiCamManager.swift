@@ -3,9 +3,22 @@ import Photos
 import SwiftUI
 import CoreImage
 
-/// MultiCamManager - Records portrait (9:16) and landscape (16:9) simultaneously
-/// Portrait: MovieFileOutput from wide camera (simple)
-/// Landscape: VideoDataOutput from ultra-wide + cropping + AssetWriter (for true landscape content)
+// MARK: - Recording Mode
+enum RecordingMode: String, CaseIterable {
+    case dualLens = "Dual Lens"
+    case streamer = "Streamer"
+    
+    var description: String {
+        switch self {
+        case .dualLens: return "Two separate videos (portrait + landscape)"
+        case .streamer: return "One video with face cam PiP"
+        }
+    }
+}
+
+/// MultiCamManager - Records video using multiple cameras
+/// - Dual Lens: Portrait (9:16) + Landscape (16:9) as separate files
+/// - Streamer: Main video + face cam PiP baked in as single file
 @MainActor
 class MultiCamManager: NSObject, ObservableObject {
     
@@ -15,11 +28,13 @@ class MultiCamManager: NSObject, ObservableObject {
     @Published var permissionGranted = false
     @Published var isSessionRunning = false
     @Published var errorMessage: String?
+    @Published var recordingMode: RecordingMode = .dualLens
     
     // MARK: - Session & Devices
     private var multiCamSession: AVCaptureMultiCamSession?
-    private var wideCamera: AVCaptureDevice?      // For portrait (9:16)
+    private var wideCamera: AVCaptureDevice?      // For portrait (9:16) / main view
     private var ultraWideCamera: AVCaptureDevice? // For landscape (16:9)
+    private var frontCamera: AVCaptureDevice?     // For streamer face cam
     
     // MARK: - Portrait Output (simple MovieFileOutput)
     private var portraitMovieOutput: AVCaptureMovieFileOutput?
@@ -27,8 +42,8 @@ class MultiCamManager: NSObject, ObservableObject {
     private var portraitFinished = false
     
     // MARK: - Landscape Output (VideoDataOutput + AssetWriter for cropping)
-    private var landscapeVideoOutput: AVCaptureVideoDataOutput?
-    private var landscapeAudioOutput: AVCaptureAudioDataOutput?
+    private nonisolated(unsafe) var landscapeVideoOutput: AVCaptureVideoDataOutput?
+    private nonisolated(unsafe) var landscapeAudioOutput: AVCaptureAudioDataOutput?
     private let landscapeQueue = DispatchQueue(label: "com.dualcam.landscape")
     private let audioQueue = DispatchQueue(label: "com.dualcam.audio")
     
@@ -45,6 +60,24 @@ class MultiCamManager: NSObject, ObservableObject {
     
     private var landscapeFinished = false
     
+    // MARK: - Streamer Mode State
+    private nonisolated(unsafe) var mainVideoOutput: AVCaptureVideoDataOutput?
+    private nonisolated(unsafe) var faceCamVideoOutput: AVCaptureVideoDataOutput?
+    private nonisolated(unsafe) var streamerAudioOutput: AVCaptureAudioDataOutput?
+    private let mainQueue = DispatchQueue(label: "com.dualcam.main")
+    private let faceCamQueue = DispatchQueue(label: "com.dualcam.facecam")
+    
+    // Streamer writer state
+    private nonisolated(unsafe) var streamerWriter: AVAssetWriter?
+    private nonisolated(unsafe) var streamerVideoInput: AVAssetWriterInput?
+    private nonisolated(unsafe) var streamerAudioInput: AVAssetWriterInput?
+    private nonisolated(unsafe) var streamerPixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private nonisolated(unsafe) var streamerURL: URL?
+    private nonisolated(unsafe) var streamerWritingStarted = false
+    private nonisolated(unsafe) var streamerSessionStartTime: CMTime?
+    private nonisolated(unsafe) var latestFaceCamBuffer: CVPixelBuffer?
+    private nonisolated(unsafe) var faceCamLock = NSLock()
+    
     // MARK: - Recording State
     private var recordingTimer: Timer?
     private var recordingStartTime: Date?
@@ -52,6 +85,7 @@ class MultiCamManager: NSObject, ObservableObject {
     // MARK: - Preview Layers
     var portraitPreviewLayer: AVCaptureVideoPreviewLayer?
     var landscapePreviewLayer: AVCaptureVideoPreviewLayer?
+    var faceCamPreviewLayer: AVCaptureVideoPreviewLayer?
     
     // MARK: - Initialization
     override init() {
@@ -61,13 +95,14 @@ class MultiCamManager: NSObject, ObservableObject {
     
     // MARK: - Camera Discovery
     private func discoverCameras() {
-        let discovery = AVCaptureDevice.DiscoverySession(
+        // Back cameras
+        let backDiscovery = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.builtInWideAngleCamera, .builtInUltraWideCamera],
             mediaType: .video,
             position: .back
         )
         
-        for device in discovery.devices {
+        for device in backDiscovery.devices {
             switch device.deviceType {
             case .builtInWideAngleCamera:
                 wideCamera = device
@@ -79,6 +114,18 @@ class MultiCamManager: NSObject, ObservableObject {
                 break
             }
         }
+        
+        // Front camera
+        let frontDiscovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInWideAngleCamera],
+            mediaType: .video,
+            position: .front
+        )
+        
+        if let front = frontDiscovery.devices.first {
+            frontCamera = front
+            print("📷 Found front camera: \(front.localizedName)")
+        }
     }
     
     // MARK: - Permissions
@@ -86,13 +133,13 @@ class MultiCamManager: NSObject, ObservableObject {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             permissionGranted = true
-            setupMultiCamSession()
+            setupSession()
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
                 Task { @MainActor in
                     self?.permissionGranted = granted
                     if granted {
-                        self?.setupMultiCamSession()
+                        self?.setupSession()
                     }
                 }
             }
@@ -103,6 +150,38 @@ class MultiCamManager: NSObject, ObservableObject {
         
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
+    }
+    
+    // MARK: - Mode Switching
+    func switchMode(to mode: RecordingMode) {
+        guard !isRecording else { return }
+        recordingMode = mode
+        stopSession()
+        setupSession()
+    }
+    
+    private func setupSession() {
+        switch recordingMode {
+        case .dualLens:
+            setupMultiCamSession()
+        case .streamer:
+            setupStreamerSession()
+        }
+    }
+    
+    private func stopSession() {
+        multiCamSession?.stopRunning()
+        multiCamSession = nil
+        portraitPreviewLayer = nil
+        landscapePreviewLayer = nil
+        faceCamPreviewLayer = nil
+        portraitMovieOutput = nil
+        landscapeVideoOutput = nil
+        landscapeAudioOutput = nil
+        mainVideoOutput = nil
+        faceCamVideoOutput = nil
+        streamerAudioOutput = nil
+        isSessionRunning = false
     }
     
     // MARK: - MultiCam Session Setup
@@ -258,15 +337,178 @@ class MultiCamManager: NSObject, ObservableObject {
         }
     }
     
+    // MARK: - Streamer Session Setup
+    private func setupStreamerSession() {
+        guard AVCaptureMultiCamSession.isMultiCamSupported else {
+            errorMessage = "Multi-cam not supported on this device"
+            print("❌ Multi-cam not supported")
+            return
+        }
+        
+        guard let wide = wideCamera, let front = frontCamera else {
+            errorMessage = "Required cameras not available"
+            print("❌ Missing cameras - wide: \(wideCamera != nil), front: \(frontCamera != nil)")
+            return
+        }
+        
+        print("🎬 Setting up Streamer session (main + face cam)...")
+        
+        let session = AVCaptureMultiCamSession()
+        session.beginConfiguration()
+        
+        do {
+            // === BACK CAMERA (Main view) ===
+            let wideInput = try AVCaptureDeviceInput(device: wide)
+            guard session.canAddInput(wideInput) else {
+                throw NSError(domain: "Streamer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Cannot add wide camera input"])
+            }
+            session.addInputWithNoConnections(wideInput)
+            print("✅ Main camera (wide) input added")
+            
+            // Main video data output
+            let mainOutput = AVCaptureVideoDataOutput()
+            mainOutput.setSampleBufferDelegate(self, queue: mainQueue)
+            mainOutput.videoSettings = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            ]
+            guard session.canAddOutput(mainOutput) else {
+                throw NSError(domain: "Streamer", code: 2, userInfo: [NSLocalizedDescriptionKey: "Cannot add main video output"])
+            }
+            session.addOutputWithNoConnections(mainOutput)
+            
+            guard let wideVideoPort = wideInput.ports(for: .video, sourceDeviceType: .builtInWideAngleCamera, sourceDevicePosition: .back).first else {
+                throw NSError(domain: "Streamer", code: 3, userInfo: [NSLocalizedDescriptionKey: "No wide camera port"])
+            }
+            
+            let mainConnection = AVCaptureConnection(inputPorts: [wideVideoPort], output: mainOutput)
+            mainConnection.videoOrientation = .portrait
+            guard session.canAddConnection(mainConnection) else {
+                throw NSError(domain: "Streamer", code: 4, userInfo: [NSLocalizedDescriptionKey: "Cannot add main connection"])
+            }
+            session.addConnection(mainConnection)
+            mainVideoOutput = mainOutput
+            print("✅ Main video output connected")
+            
+            // === FRONT CAMERA (Face cam) ===
+            let frontInput = try AVCaptureDeviceInput(device: front)
+            guard session.canAddInput(frontInput) else {
+                throw NSError(domain: "Streamer", code: 5, userInfo: [NSLocalizedDescriptionKey: "Cannot add front camera input"])
+            }
+            session.addInputWithNoConnections(frontInput)
+            print("✅ Front camera input added")
+            
+            // Face cam video data output
+            let faceCamOutput = AVCaptureVideoDataOutput()
+            faceCamOutput.setSampleBufferDelegate(self, queue: faceCamQueue)
+            faceCamOutput.videoSettings = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            ]
+            guard session.canAddOutput(faceCamOutput) else {
+                throw NSError(domain: "Streamer", code: 6, userInfo: [NSLocalizedDescriptionKey: "Cannot add face cam output"])
+            }
+            session.addOutputWithNoConnections(faceCamOutput)
+            
+            guard let frontVideoPort = frontInput.ports(for: .video, sourceDeviceType: .builtInWideAngleCamera, sourceDevicePosition: .front).first else {
+                throw NSError(domain: "Streamer", code: 7, userInfo: [NSLocalizedDescriptionKey: "No front camera port"])
+            }
+            
+            let faceCamConnection = AVCaptureConnection(inputPorts: [frontVideoPort], output: faceCamOutput)
+            faceCamConnection.videoOrientation = .portrait
+            faceCamConnection.isVideoMirrored = true  // Mirror front camera like a selfie
+            guard session.canAddConnection(faceCamConnection) else {
+                throw NSError(domain: "Streamer", code: 8, userInfo: [NSLocalizedDescriptionKey: "Cannot add face cam connection"])
+            }
+            session.addConnection(faceCamConnection)
+            faceCamVideoOutput = faceCamOutput
+            print("✅ Face cam output connected (mirrored)")
+            
+            // === AUDIO ===
+            if let audioDevice = AVCaptureDevice.default(for: .audio),
+               let audioInput = try? AVCaptureDeviceInput(device: audioDevice) {
+                if session.canAddInput(audioInput) {
+                    session.addInputWithNoConnections(audioInput)
+                    
+                    if let audioPort = audioInput.ports(for: .audio, sourceDeviceType: nil, sourceDevicePosition: .unspecified).first {
+                        let audioOutput = AVCaptureAudioDataOutput()
+                        audioOutput.setSampleBufferDelegate(self, queue: audioQueue)
+                        if session.canAddOutput(audioOutput) {
+                            session.addOutputWithNoConnections(audioOutput)
+                            let audioConnection = AVCaptureConnection(inputPorts: [audioPort], output: audioOutput)
+                            if session.canAddConnection(audioConnection) {
+                                session.addConnection(audioConnection)
+                                streamerAudioOutput = audioOutput
+                                print("✅ Audio connected")
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // === PREVIEW LAYERS ===
+            let mainPreview = AVCaptureVideoPreviewLayer(sessionWithNoConnection: session)
+            mainPreview.videoGravity = .resizeAspectFill
+            let mainPreviewConnection = AVCaptureConnection(inputPort: wideVideoPort, videoPreviewLayer: mainPreview)
+            mainPreviewConnection.videoOrientation = .portrait
+            if session.canAddConnection(mainPreviewConnection) {
+                session.addConnection(mainPreviewConnection)
+                self.portraitPreviewLayer = mainPreview
+                print("✅ Main preview layer created")
+            }
+            
+            let faceCamPreview = AVCaptureVideoPreviewLayer(sessionWithNoConnection: session)
+            faceCamPreview.videoGravity = .resizeAspectFill
+            let faceCamPreviewConnection = AVCaptureConnection(inputPort: frontVideoPort, videoPreviewLayer: faceCamPreview)
+            faceCamPreviewConnection.videoOrientation = .portrait
+            faceCamPreviewConnection.isVideoMirrored = true
+            if session.canAddConnection(faceCamPreviewConnection) {
+                session.addConnection(faceCamPreviewConnection)
+                self.faceCamPreviewLayer = faceCamPreview
+                print("✅ Face cam preview layer created")
+            }
+            
+        } catch {
+            print("❌ Streamer setup failed: \(error.localizedDescription)")
+            errorMessage = error.localizedDescription
+            session.commitConfiguration()
+            return
+        }
+        
+        session.commitConfiguration()
+        multiCamSession = session
+        
+        print("🎬 Streamer session configured, starting...")
+        
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            session.startRunning()
+            DispatchQueue.main.async {
+                self?.isSessionRunning = session.isRunning
+                print("🎬 Streamer session running: \(session.isRunning)")
+            }
+        }
+    }
+    
     // MARK: - Recording
     func startRecording() {
+        let tempDir = FileManager.default.temporaryDirectory
+        let timestamp = Int(Date().timeIntervalSince1970)
+        
+        switch recordingMode {
+        case .dualLens:
+            startDualLensRecording(tempDir: tempDir, timestamp: timestamp)
+        case .streamer:
+            startStreamerRecording(tempDir: tempDir, timestamp: timestamp)
+        }
+        
+        isRecording = true
+        recordingStartTime = Date()
+        startTimer()
+    }
+    
+    private func startDualLensRecording(tempDir: URL, timestamp: Int) {
         guard let portraitOutput = portraitMovieOutput else {
             print("❌ Portrait output not ready")
             return
         }
-        
-        let tempDir = FileManager.default.temporaryDirectory
-        let timestamp = Int(Date().timeIntervalSince1970)
         
         // Portrait - simple file output
         portraitURL = tempDir.appendingPathComponent("portrait_\(timestamp).mov")
@@ -276,7 +518,7 @@ class MultiCamManager: NSObject, ObservableObject {
         setupLandscapeWriter(tempDir: tempDir, timestamp: timestamp)
         landscapeFinished = false
         
-        print("🔴 Starting dual recording...")
+        print("🔴 Starting dual lens recording...")
         print("   Portrait: \(portraitURL!.lastPathComponent)")
         
         writerLock.lock()
@@ -286,10 +528,81 @@ class MultiCamManager: NSObject, ObservableObject {
         writerLock.unlock()
         
         portraitOutput.startRecording(to: portraitURL!, recordingDelegate: self)
+    }
+    
+    private func startStreamerRecording(tempDir: URL, timestamp: Int) {
+        setupStreamerWriter(tempDir: tempDir, timestamp: timestamp)
         
-        isRecording = true
-        recordingStartTime = Date()
-        startTimer()
+        print("🔴 Starting streamer recording...")
+        writerLock.lock()
+        if let url = streamerURL {
+            print("   Output: \(url.lastPathComponent)")
+        }
+        writerLock.unlock()
+    }
+    
+    private func setupStreamerWriter(tempDir: URL, timestamp: Int) {
+        writerLock.lock()
+        defer { writerLock.unlock() }
+        
+        let url = tempDir.appendingPathComponent("streamer_\(timestamp).mov")
+        streamerURL = url
+        
+        do {
+            let writer = try AVAssetWriter(url: url, fileType: .mov)
+            
+            // Video input - 1080x1920 portrait
+            let videoSettings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: 1080,
+                AVVideoHeightKey: 1920
+            ]
+            let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            videoInput.expectsMediaDataInRealTime = true
+            
+            let pixelBufferAttributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: 1080,
+                kCVPixelBufferHeightKey as String: 1920
+            ]
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: videoInput,
+                sourcePixelBufferAttributes: pixelBufferAttributes
+            )
+            
+            // Audio input
+            let audioSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 44100,
+                AVNumberOfChannelsKey: 2
+            ]
+            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+            audioInput.expectsMediaDataInRealTime = true
+            
+            if writer.canAdd(videoInput) {
+                writer.add(videoInput)
+            }
+            if writer.canAdd(audioInput) {
+                writer.add(audioInput)
+            }
+            
+            streamerWriter = writer
+            streamerVideoInput = videoInput
+            streamerAudioInput = audioInput
+            streamerPixelBufferAdaptor = adaptor
+            streamerWritingStarted = false
+            streamerSessionStartTime = nil
+            
+            // Reuse ciContext
+            if ciContext == nil {
+                ciContext = CIContext(options: [.useSoftwareRenderer: false])
+            }
+            
+            print("✅ Streamer writer configured (1080x1920 portrait with PiP)")
+            
+        } catch {
+            print("❌ Failed to create streamer writer: \(error)")
+        }
     }
     
     private func setupLandscapeWriter(tempDir: URL, timestamp: Int) {
@@ -357,11 +670,77 @@ class MultiCamManager: NSObject, ObservableObject {
     func stopRecording() {
         print("⏹ Stopping recording...")
         
-        portraitMovieOutput?.stopRecording()
-        finishLandscapeWriter()
+        switch recordingMode {
+        case .dualLens:
+            portraitMovieOutput?.stopRecording()
+            finishLandscapeWriter()
+        case .streamer:
+            finishStreamerWriter()
+        }
         
         isRecording = false
         stopTimer()
+    }
+    
+    private func finishStreamerWriter() {
+        mainQueue.async { [weak self] in
+            guard let self = self else { return }
+            
+            self.writerLock.lock()
+            
+            self.streamerVideoInput?.markAsFinished()
+            self.streamerAudioInput?.markAsFinished()
+            
+            guard let writer = self.streamerWriter, writer.status == .writing else {
+                self.writerLock.unlock()
+                Task { @MainActor in
+                    self.saveStreamerVideo()
+                }
+                return
+            }
+            
+            let url = self.streamerURL
+            self.writerLock.unlock()
+            
+            writer.finishWriting {
+                print("✅ Finished streamer recording")
+                
+                if let url = url {
+                    let asset = AVAsset(url: url)
+                    Task {
+                        if let track = try? await asset.loadTracks(withMediaType: .video).first {
+                            let size = try? await track.load(.naturalSize)
+                            print("📐 Streamer video size: \(size?.width ?? 0) x \(size?.height ?? 0)")
+                        }
+                    }
+                }
+                
+                Task { @MainActor in
+                    self.saveStreamerVideo()
+                }
+            }
+            
+            // Cleanup
+            self.writerLock.lock()
+            self.streamerWriter = nil
+            self.streamerVideoInput = nil
+            self.streamerAudioInput = nil
+            self.streamerPixelBufferAdaptor = nil
+            self.streamerWritingStarted = false
+            self.streamerSessionStartTime = nil
+            self.latestFaceCamBuffer = nil
+            self.writerLock.unlock()
+        }
+    }
+    
+    private func saveStreamerVideo() {
+        writerLock.lock()
+        let url = streamerURL
+        writerLock.unlock()
+        
+        guard let url = url else { return }
+        
+        saveToPhotos(url: url, name: "Streamer")
     }
     
     private func finishLandscapeWriter() {
@@ -482,10 +861,172 @@ extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptu
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         
         if output is AVCaptureVideoDataOutput {
-            processLandscapeVideoFrame(sampleBuffer, timestamp: timestamp)
+            // Determine which output this is
+            writerLock.lock()
+            let isLandscapeOutput = (output === landscapeVideoOutput)
+            let isMainOutput = (output === mainVideoOutput)
+            let isFaceCamOutput = (output === faceCamVideoOutput)
+            writerLock.unlock()
+            
+            if isLandscapeOutput {
+                processLandscapeVideoFrame(sampleBuffer, timestamp: timestamp)
+            } else if isFaceCamOutput {
+                processFaceCamFrame(sampleBuffer)
+            } else if isMainOutput {
+                processStreamerMainFrame(sampleBuffer, timestamp: timestamp)
+            }
         } else if output is AVCaptureAudioDataOutput {
-            processLandscapeAudioFrame(sampleBuffer, timestamp: timestamp)
+            writerLock.lock()
+            let isLandscapeAudio = (output === landscapeAudioOutput)
+            let isStreamerAudio = (output === streamerAudioOutput)
+            writerLock.unlock()
+            
+            if isLandscapeAudio {
+                processLandscapeAudioFrame(sampleBuffer, timestamp: timestamp)
+            } else if isStreamerAudio {
+                processStreamerAudioFrame(sampleBuffer, timestamp: timestamp)
+            }
         }
+    }
+    
+    // MARK: - Face Cam Processing (just store latest frame)
+    nonisolated private func processFaceCamFrame(_ sampleBuffer: CMSampleBuffer) {
+        guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        
+        faceCamLock.lock()
+        // CVPixelBuffer is automatically retained by Swift ARC
+        latestFaceCamBuffer = imageBuffer
+        faceCamLock.unlock()
+    }
+    
+    // MARK: - Streamer Main Frame Processing (composite with face cam)
+    nonisolated private func processStreamerMainFrame(_ sampleBuffer: CMSampleBuffer, timestamp: CMTime) {
+        writerLock.lock()
+        defer { writerLock.unlock() }
+        
+        guard let writer = streamerWriter,
+              let videoInput = streamerVideoInput,
+              let adaptor = streamerPixelBufferAdaptor,
+              let context = ciContext,
+              let mainBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            return
+        }
+        
+        let mainWidth = CGFloat(CVPixelBufferGetWidth(mainBuffer))
+        let mainHeight = CGFloat(CVPixelBufferGetHeight(mainBuffer))
+        
+        // Start writer on first frame
+        if !streamerWritingStarted {
+            streamerWritingStarted = true
+            streamerSessionStartTime = timestamp
+            writer.startWriting()
+            writer.startSession(atSourceTime: timestamp)
+            
+            print("📐 Streamer main frame: \(Int(mainWidth)) x \(Int(mainHeight))")
+            print("📐 PiP will be composited in bottom-right corner")
+        }
+        
+        guard writer.status == .writing, videoInput.isReadyForMoreMediaData else { return }
+        
+        // Create main image
+        var mainImage = CIImage(cvPixelBuffer: mainBuffer)
+        
+        // Scale main to output size if needed
+        let outputWidth: CGFloat = 1080
+        let outputHeight: CGFloat = 1920
+        
+        if mainWidth != outputWidth || mainHeight != outputHeight {
+            let scaleX = outputWidth / mainWidth
+            let scaleY = outputHeight / mainHeight
+            mainImage = mainImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+        }
+        
+        // Get face cam frame and composite as PiP
+        faceCamLock.lock()
+        let faceCamBuffer = latestFaceCamBuffer
+        faceCamLock.unlock()
+        
+        if let faceBuffer = faceCamBuffer {
+            // Create face cam image
+            var faceImage = CIImage(cvPixelBuffer: faceBuffer)
+            
+            let faceWidth = CGFloat(CVPixelBufferGetWidth(faceBuffer))
+            let faceHeight = CGFloat(CVPixelBufferGetHeight(faceBuffer))
+            
+            // PiP size: 1/4 of output width
+            let pipWidth: CGFloat = outputWidth * 0.28
+            let pipHeight = pipWidth * (faceHeight / faceWidth)
+            
+            // Scale face cam to PiP size
+            let faceScaleX = pipWidth / faceWidth
+            let faceScaleY = pipHeight / faceHeight
+            faceImage = faceImage.transformed(by: CGAffineTransform(scaleX: faceScaleX, y: faceScaleY))
+            
+            // Position in bottom-right corner with padding
+            let padding: CGFloat = 20
+            let pipX = outputWidth - pipWidth - padding
+            let pipY = padding  // CIImage origin is bottom-left
+            faceImage = faceImage.transformed(by: CGAffineTransform(translationX: pipX, y: pipY))
+            
+            // Create circular mask for PiP
+            let centerX = pipX + pipWidth / 2
+            let centerY = pipY + pipHeight / 2
+            let radius = min(pipWidth, pipHeight) / 2
+            
+            // Create radial gradient for circular mask
+            let maskFilter = CIFilter(name: "CIRadialGradient")!
+            maskFilter.setValue(CIVector(x: centerX, y: centerY), forKey: "inputCenter")
+            maskFilter.setValue(radius - 2, forKey: "inputRadius0")  // Solid inner
+            maskFilter.setValue(radius, forKey: "inputRadius1")       // Fade outer
+            maskFilter.setValue(CIColor.white, forKey: "inputColor0")
+            maskFilter.setValue(CIColor.clear, forKey: "inputColor1")
+            
+            if let maskImage = maskFilter.outputImage {
+                // Apply mask to face image
+                let blendFilter = CIFilter(name: "CIBlendWithMask")!
+                blendFilter.setValue(faceImage, forKey: kCIInputImageKey)
+                blendFilter.setValue(mainImage, forKey: kCIInputBackgroundImageKey)
+                blendFilter.setValue(maskImage, forKey: kCIInputMaskImageKey)
+                
+                if let composited = blendFilter.outputImage {
+                    mainImage = composited
+                }
+            }
+        }
+        
+        // Render to pixel buffer
+        guard let pixelBufferPool = adaptor.pixelBufferPool else {
+            print("⚠️ No pixel buffer pool")
+            return
+        }
+        
+        var newPixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(nil, pixelBufferPool, &newPixelBuffer)
+        
+        guard status == kCVReturnSuccess, let outputBuffer = newPixelBuffer else {
+            print("⚠️ Failed to create pixel buffer: \(status)")
+            return
+        }
+        
+        // Crop to output size (in case mainImage is larger)
+        let outputRect = CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight)
+        context.render(mainImage, to: outputBuffer, bounds: outputRect, colorSpace: CGColorSpaceCreateDeviceRGB())
+        
+        adaptor.append(outputBuffer, withPresentationTime: timestamp)
+    }
+    
+    // MARK: - Streamer Audio Processing
+    nonisolated private func processStreamerAudioFrame(_ sampleBuffer: CMSampleBuffer, timestamp: CMTime) {
+        writerLock.lock()
+        defer { writerLock.unlock() }
+        
+        guard streamerWritingStarted,
+              let audioInput = streamerAudioInput,
+              audioInput.isReadyForMoreMediaData else {
+            return
+        }
+        
+        audioInput.append(sampleBuffer)
     }
     
     /// Process ultra-wide camera frames: crop center horizontal strip (16:9) for landscape

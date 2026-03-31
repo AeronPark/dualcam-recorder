@@ -21,12 +21,14 @@ class DualPreviewUIView: UIView {
     private var mainPreviewLayer: AVCaptureVideoPreviewLayer?
     private var pipContainer: UIView?
     private var pipPreviewLayer: AVCaptureVideoPreviewLayer?
+    private var pipLabel: UILabel?
     
-    // PiP settings (16:9 aspect ratio)
-    private let pipWidth: CGFloat = 120
-    private let pipHeight: CGFloat = 68  // 120 * 9/16
+    // PiP settings
+    private var pipWidth: CGFloat = 120
+    private var pipHeight: CGFloat = 68  // 16:9 default
     private let pipMargin: CGFloat = 16
-    private let pipCornerRadius: CGFloat = 8
+    private var pipCornerRadius: CGFloat = 8
+    private var isCircular = false
     
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -41,7 +43,6 @@ class DualPreviewUIView: UIView {
     private func setupPiPContainer() {
         let container = UIView()
         container.backgroundColor = .black
-        container.layer.cornerRadius = pipCornerRadius
         container.layer.borderWidth = 2
         container.layer.borderColor = UIColor.white.cgColor
         container.layer.masksToBounds = true
@@ -51,15 +52,14 @@ class DualPreviewUIView: UIView {
         
         // Label
         let label = UILabel()
-        label.text = "16:9"
         label.font = .systemFont(ofSize: 9, weight: .bold)
         label.textColor = .white
         label.backgroundColor = UIColor.black.withAlphaComponent(0.5)
         label.textAlignment = .center
         label.layer.cornerRadius = 3
         label.layer.masksToBounds = true
-        label.tag = 100
         container.addSubview(label)
+        pipLabel = label
     }
     
     override func layoutSubviews() {
@@ -67,7 +67,27 @@ class DualPreviewUIView: UIView {
         
         mainPreviewLayer?.frame = bounds
         
-        if let container = pipContainer {
+        updatePiPLayout()
+    }
+    
+    private func updatePiPLayout() {
+        guard let container = pipContainer else { return }
+        
+        if isCircular {
+            // Circular PiP for face cam (streamer mode)
+            let size: CGFloat = 140
+            container.layer.cornerRadius = size / 2
+            container.frame = CGRect(
+                x: bounds.width - size - pipMargin,
+                y: bounds.height - size - pipMargin - 200, // Above buttons
+                width: size,
+                height: size
+            )
+            pipPreviewLayer?.frame = container.bounds
+            pipLabel?.isHidden = true
+        } else {
+            // Rectangular PiP for landscape (dual lens mode)
+            container.layer.cornerRadius = pipCornerRadius
             let safeTop = safeAreaInsets.top + 50
             container.frame = CGRect(
                 x: bounds.width - pipWidth - pipMargin,
@@ -75,17 +95,26 @@ class DualPreviewUIView: UIView {
                 width: pipWidth,
                 height: pipHeight
             )
-            
             pipPreviewLayer?.frame = container.bounds
-            
-            if let label = container.viewWithTag(100) as? UILabel {
-                label.frame = CGRect(x: 4, y: pipHeight - 16, width: 28, height: 12)
-            }
+            pipLabel?.frame = CGRect(x: 4, y: pipHeight - 16, width: 28, height: 12)
+            pipLabel?.text = "16:9"
+            pipLabel?.isHidden = false
         }
     }
     
     func updatePreviews() {
         guard let camera = camera else { return }
+        
+        // Determine mode
+        let isStreamerMode = camera.recordingMode == .streamer
+        
+        // Update PiP style based on mode
+        if isCircular != isStreamerMode {
+            isCircular = isStreamerMode
+            pipPreviewLayer?.removeFromSuperlayer()
+            pipPreviewLayer = nil
+            updatePiPLayout()
+        }
         
         // Main preview (portrait from wide camera)
         if let portraitLayer = camera.portraitPreviewLayer {
@@ -99,19 +128,31 @@ class DualPreviewUIView: UIView {
             }
         }
         
-        // PiP preview (landscape from ultra-wide camera)
-        if let landscapeLayer = camera.landscapePreviewLayer,
-           let container = pipContainer {
-            if pipPreviewLayer !== landscapeLayer {
+        // PiP preview based on mode
+        let pipLayer: AVCaptureVideoPreviewLayer?
+        if isStreamerMode {
+            pipLayer = camera.faceCamPreviewLayer
+        } else {
+            pipLayer = camera.landscapePreviewLayer
+        }
+        
+        if let layer = pipLayer, let container = pipContainer {
+            if pipPreviewLayer !== layer {
                 pipPreviewLayer?.removeFromSuperlayer()
-                landscapeLayer.frame = container.bounds
-                landscapeLayer.videoGravity = .resizeAspectFill
-                landscapeLayer.cornerRadius = pipCornerRadius
-                container.layer.insertSublayer(landscapeLayer, at: 0)
-                pipPreviewLayer = landscapeLayer
+                layer.frame = container.bounds
+                layer.videoGravity = .resizeAspectFill
+                if isCircular {
+                    layer.cornerRadius = container.bounds.width / 2
+                } else {
+                    layer.cornerRadius = pipCornerRadius
+                }
+                container.layer.insertSublayer(layer, at: 0)
+                pipPreviewLayer = layer
                 container.isHidden = false
-                print("📱 PiP preview connected (landscape)")
+                print("📱 PiP preview connected (\(isStreamerMode ? "face cam" : "landscape"))")
             }
+        } else {
+            pipContainer?.isHidden = true
         }
     }
 }

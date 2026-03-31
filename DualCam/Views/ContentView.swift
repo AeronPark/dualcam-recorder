@@ -61,6 +61,33 @@ struct ContentView: View {
                         .padding(.bottom, 10)
                 }
                 
+                // Mode selector
+                HStack(spacing: 0) {
+                    ForEach(RecordingMode.allCases, id: \.self) { mode in
+                        Button(action: {
+                            camera.switchMode(to: mode)
+                        }) {
+                            Text(mode.rawValue)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundColor(camera.recordingMode == mode ? .black : .white)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 10)
+                                .background(
+                                    camera.recordingMode == mode 
+                                        ? Color.yellow 
+                                        : Color.black.opacity(0.5)
+                                )
+                        }
+                        .disabled(camera.isRecording)
+                    }
+                }
+                .cornerRadius(25)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 25)
+                        .stroke(Color.white.opacity(0.3), lineWidth: 1)
+                )
+                .padding(.bottom, 20)
+                
                 // Record button
                 Button(action: {
                     if camera.isRecording {
