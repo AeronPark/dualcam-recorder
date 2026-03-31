@@ -490,7 +490,7 @@ extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptu
         }
     }
     
-    /// Process ultra-wide camera frames: crop center to 16:9, rotate, write to landscape video
+    /// Process ultra-wide camera frames: crop center horizontal strip (16:9), scale to 1920x1080
     nonisolated private func processLandscapeVideoFrame(_ sampleBuffer: CMSampleBuffer, timestamp: CMTime) {
         writerLock.lock()
         defer { writerLock.unlock() }
@@ -513,54 +513,33 @@ extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptu
             let w = CVPixelBufferGetWidth(imageBuffer)
             let h = CVPixelBufferGetHeight(imageBuffer)
             print("📐 Landscape source frame: \(w) x \(h) (portrait)")
-            print("📐 Will crop center to 16:9 and rotate to landscape")
+            print("📐 Will crop center 16:9 strip and scale to 1920x1080 (no rotation)")
         }
         
         guard writer.status == .writing, videoInput.isReadyForMoreMediaData else { return }
         
-        // Frame is portrait: e.g., 1080 x 1920 (width x height)
+        // Frame is portrait: e.g., 1080w x 1920h
         let frameWidth = CGFloat(CVPixelBufferGetWidth(imageBuffer))
         let frameHeight = CGFloat(CVPixelBufferGetHeight(imageBuffer))
         
-        // Crop a horizontal strip from center for 16:9 landscape content
-        // The strip width = frameWidth, strip height = frameWidth * 9/16
+        // Crop a horizontal strip from center
+        // Strip dimensions: frameWidth x (frameWidth * 9/16) = 1080 x 607.5
+        // This is already 16:9 aspect ratio (wider than tall)
         let cropHeight = frameWidth * 9.0 / 16.0
         let cropY = (frameHeight - cropHeight) / 2.0
         let cropRect = CGRect(x: 0, y: cropY, width: frameWidth, height: cropHeight)
         
-        // Create CIImage, crop, and rotate
+        // Crop
         var ciImage = CIImage(cvPixelBuffer: imageBuffer)
-        
-        // Crop the center strip
         ciImage = ciImage.cropped(to: cropRect)
         
-        // Translate so crop rect origin is at (0,0)
+        // Translate origin to (0,0)
         ciImage = ciImage.transformed(by: CGAffineTransform(translationX: 0, y: -cropY))
         
-        // Now we have a strip that's frameWidth x cropHeight (e.g., 1080 x 607.5)
-        // Rotate 90° clockwise to make it landscape (607.5 x 1080 becomes 1080 x 607.5... wait that's wrong)
-        
-        // Actually, let me think again:
-        // Portrait frame: 1080w x 1920h
-        // Crop center strip: 1080w x 607.5h
-        // To make landscape 16:9: we need to ROTATE the strip 90° AND scale to 1920x1080
-        
-        // Rotate 90° clockwise: (x,y) -> (y, width-x)
-        // After rotation, dimensions swap: 607.5w x 1080h
-        // Then scale to 1920x1080
-        
-        // Actually, simpler approach: rotate -90° (counterclockwise) 
-        // Then scale to fit 1920x1080
-        
-        let rotatedImage = ciImage
-            .transformed(by: CGAffineTransform(rotationAngle: -.pi / 2))
-            .transformed(by: CGAffineTransform(translationX: 0, y: frameWidth)) // fix negative coords after rotation
-        
-        // After rotation: dimensions are cropHeight x frameWidth = 607.5 x 1080
-        // Scale to 1920 x 1080
-        let scaleX = 1920.0 / cropHeight
-        let scaleY = 1080.0 / frameWidth
-        let scaledImage = rotatedImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+        // Scale from 1080x607.5 to 1920x1080 (no rotation needed - already landscape aspect)
+        let scaleX = 1920.0 / frameWidth
+        let scaleY = 1080.0 / cropHeight
+        ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
         
         // Render to pixel buffer
         guard let pixelBufferPool = adaptor.pixelBufferPool else { return }
@@ -568,7 +547,7 @@ extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptu
         CVPixelBufferPoolCreatePixelBuffer(nil, pixelBufferPool, &newPixelBuffer)
         
         guard let outputBuffer = newPixelBuffer else { return }
-        context.render(scaledImage, to: outputBuffer)
+        context.render(ciImage, to: outputBuffer)
         adaptor.append(outputBuffer, withPresentationTime: timestamp)
     }
     
