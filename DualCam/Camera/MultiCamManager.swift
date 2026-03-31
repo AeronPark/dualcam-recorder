@@ -574,12 +574,15 @@ class MultiCamManager: NSObject, ObservableObject {
             }
             
             let faceCamConnection = AVCaptureConnection(inputPorts: [frontVideoPort], output: faceCamOutput)
-            faceCamConnection.videoOrientation = .portrait
-            faceCamConnection.isVideoMirrored = true  // Mirror front camera like a selfie
             guard session.canAddConnection(faceCamConnection) else {
                 throw NSError(domain: "Streamer", code: 8, userInfo: [NSLocalizedDescriptionKey: "Cannot add face cam connection"])
             }
             session.addConnection(faceCamConnection)
+            // Set these AFTER adding connection
+            faceCamConnection.videoOrientation = .portrait
+            if faceCamConnection.isVideoMirroringSupported {
+                faceCamConnection.isVideoMirrored = true  // Mirror front camera like a selfie
+            }
             faceCamVideoOutput = faceCamOutput
             print("✅ Face cam output connected (mirrored)")
             
@@ -619,10 +622,13 @@ class MultiCamManager: NSObject, ObservableObject {
             let faceCamPreview = AVCaptureVideoPreviewLayer(sessionWithNoConnection: session)
             faceCamPreview.videoGravity = .resizeAspectFill
             let faceCamPreviewConnection = AVCaptureConnection(inputPort: frontVideoPort, videoPreviewLayer: faceCamPreview)
-            faceCamPreviewConnection.videoOrientation = .portrait
-            faceCamPreviewConnection.isVideoMirrored = true
             if session.canAddConnection(faceCamPreviewConnection) {
                 session.addConnection(faceCamPreviewConnection)
+                // Set these AFTER adding connection
+                faceCamPreviewConnection.videoOrientation = .portrait
+                if faceCamPreviewConnection.isVideoMirroringSupported {
+                    faceCamPreviewConnection.isVideoMirrored = true
+                }
                 self.faceCamPreviewLayer = faceCamPreview
                 print("✅ Face cam preview layer created")
             }
