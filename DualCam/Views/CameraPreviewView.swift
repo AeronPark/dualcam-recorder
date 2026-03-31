@@ -75,7 +75,8 @@ class DualPreviewUIView: UIView {
         
         if isCircular {
             // Circular PiP for face cam (streamer mode)
-            let size: CGFloat = 180  // Larger face cam preview
+            // Size based on camera's pipSize setting (scaled for preview)
+            let size: CGFloat = 120 + CGFloat((camera?.pipSize ?? 0.35) * 200)  // ~140-220
             container.layer.cornerRadius = size / 2
             container.frame = CGRect(
                 x: bounds.width - size - pipMargin,

@@ -38,6 +38,7 @@ class MultiCamManager: NSObject, ObservableObject {
     @Published var isSessionRunning = false
     @Published var errorMessage: String?
     @Published var recordingMode: RecordingMode = .dualLens
+    @Published var pipSize: Double = 0.35  // 0.2 to 0.5 (20% to 50% of frame)
     
     // MARK: - Session & Devices
     private var multiCamSession: AVCaptureMultiCamSession?
@@ -77,6 +78,7 @@ class MultiCamManager: NSObject, ObservableObject {
     private nonisolated(unsafe) var portraitPixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private nonisolated(unsafe) var portraitWritingStarted = false
     private nonisolated(unsafe) var isSingleLensMode = false
+    private nonisolated(unsafe) var currentPipSize: Double = 0.35
     
     // MARK: - Streamer Mode State
     private nonisolated(unsafe) var mainVideoOutput: AVCaptureVideoDataOutput?
@@ -790,6 +792,11 @@ class MultiCamManager: NSObject, ObservableObject {
     }
     
     private func startStreamerRecording(tempDir: URL, timestamp: Int) {
+        // Capture current settings
+        writerLock.lock()
+        currentPipSize = pipSize
+        writerLock.unlock()
+        
         setupStreamerWriter(tempDir: tempDir, timestamp: timestamp)
         
         print("🔴 Starting streamer recording...")
@@ -1375,7 +1382,7 @@ extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptu
             let faceHeight = CGFloat(CVPixelBufferGetHeight(faceBuffer))
             
             // PiP size: 1/4 of output width
-            let pipWidth: CGFloat = outputWidth * 0.35  // 35% of frame width
+            let pipWidth: CGFloat = outputWidth * currentPipSize
             let pipHeight = pipWidth * (faceHeight / faceWidth)
             
             // Scale face cam to PiP size

@@ -61,6 +61,31 @@ struct ContentView: View {
                         .padding(.bottom, 10)
                 }
                 
+                // PiP Size slider (only show in Streamer mode)
+                if camera.recordingMode == .streamer {
+                    VStack(spacing: 4) {
+                        Text("Face Cam Size")
+                            .font(.caption)
+                            .foregroundColor(.white.opacity(0.8))
+                        HStack {
+                            Image(systemName: "person.crop.circle")
+                                .font(.caption)
+                                .foregroundColor(.white.opacity(0.6))
+                            Slider(value: $camera.pipSize, in: 0.2...0.5, step: 0.05)
+                                .accentColor(.yellow)
+                                .frame(width: 150)
+                            Image(systemName: "person.crop.circle.fill")
+                                .font(.title3)
+                                .foregroundColor(.white.opacity(0.6))
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 10)
+                    .background(.black.opacity(0.5))
+                    .cornerRadius(12)
+                    .padding(.bottom, 10)
+                }
+                
                 // Mode selector
                 HStack(spacing: 0) {
                     ForEach(RecordingMode.allCases, id: \.self) { mode in
