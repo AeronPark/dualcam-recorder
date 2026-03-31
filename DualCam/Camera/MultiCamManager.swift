@@ -1,9 +1,11 @@
 import AVFoundation
 import Photos
 import SwiftUI
+import CoreImage
 
 /// MultiCamManager - Records portrait (9:16) and landscape (16:9) simultaneously
-/// using two physical cameras with AVCaptureMultiCamSession
+/// Portrait: MovieFileOutput from wide camera (simple)
+/// Landscape: VideoDataOutput from ultra-wide + cropping + AssetWriter (for true landscape content)
 @MainActor
 class MultiCamManager: NSObject, ObservableObject {
     
@@ -19,15 +21,31 @@ class MultiCamManager: NSObject, ObservableObject {
     private var wideCamera: AVCaptureDevice?      // For portrait (9:16)
     private var ultraWideCamera: AVCaptureDevice? // For landscape (16:9)
     
-    // MARK: - Outputs
+    // MARK: - Portrait Output (simple MovieFileOutput)
     private var portraitMovieOutput: AVCaptureMovieFileOutput?
-    private var landscapeMovieOutput: AVCaptureMovieFileOutput?
+    private var portraitURL: URL?
+    private var portraitFinished = false
+    
+    // MARK: - Landscape Output (VideoDataOutput + AssetWriter for cropping)
+    private var landscapeVideoOutput: AVCaptureVideoDataOutput?
+    private var landscapeAudioOutput: AVCaptureAudioDataOutput?
+    private let landscapeQueue = DispatchQueue(label: "com.dualcam.landscape")
+    private let audioQueue = DispatchQueue(label: "com.dualcam.audio")
+    
+    // Asset writer for landscape (nonisolated for background queue access)
+    private let writerLock = NSLock()
+    private nonisolated(unsafe) var landscapeWriter: AVAssetWriter?
+    private nonisolated(unsafe) var landscapeVideoInput: AVAssetWriterInput?
+    private nonisolated(unsafe) var landscapeAudioInput: AVAssetWriterInput?
+    private nonisolated(unsafe) var landscapePixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private nonisolated(unsafe) var landscapeURL: URL?
+    private nonisolated(unsafe) var landscapeWritingStarted = false
+    private nonisolated(unsafe) var landscapeSessionStartTime: CMTime?
+    private nonisolated(unsafe) var ciContext: CIContext?
+    
+    private var landscapeFinished = false
     
     // MARK: - Recording State
-    private var portraitURL: URL?
-    private var landscapeURL: URL?
-    private var portraitFinished = false
-    private var landscapeFinished = false
     private var recordingTimer: Timer?
     private var recordingStartTime: Date?
     
@@ -101,13 +119,13 @@ class MultiCamManager: NSObject, ObservableObject {
             return
         }
         
-        print("🎬 Setting up MultiCam session...")
+        print("🎬 Setting up MultiCam session with cropping...")
         
         let session = AVCaptureMultiCamSession()
         session.beginConfiguration()
         
         do {
-            // === WIDE CAMERA (Portrait 9:16) ===
+            // === WIDE CAMERA (Portrait 9:16) - Simple MovieFileOutput ===
             let wideInput = try AVCaptureDeviceInput(device: wide)
             guard session.canAddInput(wideInput) else {
                 throw NSError(domain: "MultiCam", code: 1, userInfo: [NSLocalizedDescriptionKey: "Cannot add wide camera input"])
@@ -122,7 +140,6 @@ class MultiCamManager: NSObject, ObservableObject {
             }
             session.addOutputWithNoConnections(portraitOutput)
             
-            // Connect wide camera -> portrait output with PORTRAIT orientation
             guard let wideVideoPort = wideInput.ports(for: .video, sourceDeviceType: .builtInWideAngleCamera, sourceDevicePosition: .back).first else {
                 throw NSError(domain: "MultiCam", code: 3, userInfo: [NSLocalizedDescriptionKey: "No wide camera port"])
             }
@@ -134,11 +151,9 @@ class MultiCamManager: NSObject, ObservableObject {
             }
             session.addConnection(portraitConnection)
             portraitMovieOutput = portraitOutput
-            print("✅ Portrait output connected")
-            print("   Camera: \(wide.localizedName) (\(wide.deviceType.rawValue))")
-            print("   Port: \(wideVideoPort.sourceDeviceType?.rawValue ?? "nil")")
+            print("✅ Portrait MovieFileOutput connected")
             
-            // === ULTRA-WIDE CAMERA (Landscape 16:9) ===
+            // === ULTRA-WIDE CAMERA (Landscape 16:9) - VideoDataOutput for cropping ===
             let ultraWideInput = try AVCaptureDeviceInput(device: ultraWide)
             guard session.canAddInput(ultraWideInput) else {
                 throw NSError(domain: "MultiCam", code: 5, userInfo: [NSLocalizedDescriptionKey: "Cannot add ultra-wide camera input"])
@@ -146,35 +161,32 @@ class MultiCamManager: NSObject, ObservableObject {
             session.addInputWithNoConnections(ultraWideInput)
             print("✅ Ultra-wide camera input added")
             
-            // Landscape movie output
-            let landscapeOutput = AVCaptureMovieFileOutput()
-            guard session.canAddOutput(landscapeOutput) else {
-                throw NSError(domain: "MultiCam", code: 6, userInfo: [NSLocalizedDescriptionKey: "Cannot add landscape output"])
+            // Video data output for landscape (we'll process frames)
+            let videoOutput = AVCaptureVideoDataOutput()
+            videoOutput.setSampleBufferDelegate(self, queue: landscapeQueue)
+            videoOutput.videoSettings = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            ]
+            guard session.canAddOutput(videoOutput) else {
+                throw NSError(domain: "MultiCam", code: 6, userInfo: [NSLocalizedDescriptionKey: "Cannot add landscape video output"])
             }
-            session.addOutputWithNoConnections(landscapeOutput)
+            session.addOutputWithNoConnections(videoOutput)
             
-            // Connect ultra-wide camera -> landscape output with LANDSCAPE orientation
             guard let ultraWideVideoPort = ultraWideInput.ports(for: .video, sourceDeviceType: .builtInUltraWideCamera, sourceDevicePosition: .back).first else {
                 throw NSError(domain: "MultiCam", code: 7, userInfo: [NSLocalizedDescriptionKey: "No ultra-wide camera port"])
             }
             
-            let landscapeConnection = AVCaptureConnection(inputPorts: [ultraWideVideoPort], output: landscapeOutput)
-            landscapeConnection.videoOrientation = .landscapeRight
-            // DON'T mirror - mirroring was causing issues
-            if landscapeConnection.isVideoMirroringSupported {
-                landscapeConnection.isVideoMirrored = false
+            // Capture in PORTRAIT orientation - we'll crop for landscape content
+            let landscapeVideoConnection = AVCaptureConnection(inputPorts: [ultraWideVideoPort], output: videoOutput)
+            landscapeVideoConnection.videoOrientation = .portrait
+            guard session.canAddConnection(landscapeVideoConnection) else {
+                throw NSError(domain: "MultiCam", code: 8, userInfo: [NSLocalizedDescriptionKey: "Cannot add landscape video connection"])
             }
-            print("📷 Landscape connection orientation: .landscapeRight")
-            guard session.canAddConnection(landscapeConnection) else {
-                throw NSError(domain: "MultiCam", code: 8, userInfo: [NSLocalizedDescriptionKey: "Cannot add landscape connection"])
-            }
-            session.addConnection(landscapeConnection)
-            landscapeMovieOutput = landscapeOutput
-            print("✅ Landscape output connected")
-            print("   Camera: \(ultraWide.localizedName) (\(ultraWide.deviceType.rawValue))")
-            print("   Port: \(ultraWideVideoPort.sourceDeviceType?.rawValue ?? "nil")")
+            session.addConnection(landscapeVideoConnection)
+            landscapeVideoOutput = videoOutput
+            print("✅ Landscape VideoDataOutput connected (portrait capture, will crop to 16:9)")
             
-            // === AUDIO (connect to both outputs) ===
+            // === AUDIO ===
             if let audioDevice = AVCaptureDevice.default(for: .audio),
                let audioInput = try? AVCaptureDeviceInput(device: audioDevice) {
                 if session.canAddInput(audioInput) {
@@ -187,12 +199,24 @@ class MultiCamManager: NSObject, ObservableObject {
                             session.addConnection(portraitAudioConnection)
                             print("✅ Audio connected to portrait output")
                         }
+                        
+                        // Audio data output for landscape
+                        let audioOutput = AVCaptureAudioDataOutput()
+                        audioOutput.setSampleBufferDelegate(self, queue: audioQueue)
+                        if session.canAddOutput(audioOutput) {
+                            session.addOutputWithNoConnections(audioOutput)
+                            let landscapeAudioConnection = AVCaptureConnection(inputPorts: [audioPort], output: audioOutput)
+                            if session.canAddConnection(landscapeAudioConnection) {
+                                session.addConnection(landscapeAudioConnection)
+                                landscapeAudioOutput = audioOutput
+                                print("✅ Audio connected to landscape output")
+                            }
+                        }
                     }
                 }
             }
             
             // === PREVIEW LAYERS ===
-            // Portrait preview (wide camera)
             let portraitPreview = AVCaptureVideoPreviewLayer(sessionWithNoConnection: session)
             portraitPreview.videoGravity = .resizeAspectFill
             let portraitPreviewConnection = AVCaptureConnection(inputPort: wideVideoPort, videoPreviewLayer: portraitPreview)
@@ -203,11 +227,10 @@ class MultiCamManager: NSObject, ObservableObject {
                 print("✅ Portrait preview layer created")
             }
             
-            // Landscape preview (ultra-wide camera)
             let landscapePreview = AVCaptureVideoPreviewLayer(sessionWithNoConnection: session)
             landscapePreview.videoGravity = .resizeAspectFill
             let landscapePreviewConnection = AVCaptureConnection(inputPort: ultraWideVideoPort, videoPreviewLayer: landscapePreview)
-            landscapePreviewConnection.videoOrientation = .landscapeLeft
+            landscapePreviewConnection.videoOrientation = .portrait
             if session.canAddConnection(landscapePreviewConnection) {
                 session.addConnection(landscapePreviewConnection)
                 self.landscapePreviewLayer = landscapePreview
@@ -224,9 +247,13 @@ class MultiCamManager: NSObject, ObservableObject {
         session.commitConfiguration()
         multiCamSession = session
         
+        // Initialize CIContext for image processing
+        writerLock.lock()
+        ciContext = CIContext(options: [.useSoftwareRenderer: false])
+        writerLock.unlock()
+        
         print("🎬 MultiCam session configured, starting...")
         
-        // Start session
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             session.startRunning()
             DispatchQueue.main.async {
@@ -238,41 +265,159 @@ class MultiCamManager: NSObject, ObservableObject {
     
     // MARK: - Recording
     func startRecording() {
-        guard let portraitOutput = portraitMovieOutput,
-              let landscapeOutput = landscapeMovieOutput else {
-            print("❌ Outputs not ready")
+        guard let portraitOutput = portraitMovieOutput else {
+            print("❌ Portrait output not ready")
             return
         }
         
         let tempDir = FileManager.default.temporaryDirectory
         let timestamp = Int(Date().timeIntervalSince1970)
         
+        // Portrait - simple file output
         portraitURL = tempDir.appendingPathComponent("portrait_\(timestamp).mov")
-        landscapeURL = tempDir.appendingPathComponent("landscape_\(timestamp).mov")
-        
         portraitFinished = false
+        
+        // Landscape - asset writer setup
+        setupLandscapeWriter(tempDir: tempDir, timestamp: timestamp)
         landscapeFinished = false
         
         print("🔴 Starting dual recording...")
         print("   Portrait: \(portraitURL!.lastPathComponent)")
-        print("   Landscape: \(landscapeURL!.lastPathComponent)")
+        
+        writerLock.lock()
+        if let url = landscapeURL {
+            print("   Landscape: \(url.lastPathComponent)")
+        }
+        writerLock.unlock()
         
         portraitOutput.startRecording(to: portraitURL!, recordingDelegate: self)
-        landscapeOutput.startRecording(to: landscapeURL!, recordingDelegate: self)
         
         isRecording = true
         recordingStartTime = Date()
         startTimer()
     }
     
+    private func setupLandscapeWriter(tempDir: URL, timestamp: Int) {
+        writerLock.lock()
+        defer { writerLock.unlock() }
+        
+        let url = tempDir.appendingPathComponent("landscape_\(timestamp).mov")
+        landscapeURL = url
+        
+        do {
+            let writer = try AVAssetWriter(url: url, fileType: .mov)
+            
+            // Video input - 1920x1080 landscape
+            let videoSettings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: 1920,
+                AVVideoHeightKey: 1080
+            ]
+            let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            videoInput.expectsMediaDataInRealTime = true
+            
+            // Pixel buffer adaptor for writing cropped frames
+            let pixelBufferAttributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: 1920,
+                kCVPixelBufferHeightKey as String: 1080
+            ]
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: videoInput,
+                sourcePixelBufferAttributes: pixelBufferAttributes
+            )
+            
+            // Audio input
+            let audioSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 44100,
+                AVNumberOfChannelsKey: 2
+            ]
+            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+            audioInput.expectsMediaDataInRealTime = true
+            
+            if writer.canAdd(videoInput) {
+                writer.add(videoInput)
+            }
+            if writer.canAdd(audioInput) {
+                writer.add(audioInput)
+            }
+            
+            landscapeWriter = writer
+            landscapeVideoInput = videoInput
+            landscapeAudioInput = audioInput
+            landscapePixelBufferAdaptor = adaptor
+            landscapeWritingStarted = false
+            landscapeSessionStartTime = nil
+            
+            print("✅ Landscape AssetWriter configured for 1920x1080")
+            
+        } catch {
+            print("❌ Failed to create landscape writer: \(error)")
+        }
+    }
+    
     func stopRecording() {
         print("⏹ Stopping recording...")
         
         portraitMovieOutput?.stopRecording()
-        landscapeMovieOutput?.stopRecording()
+        finishLandscapeWriter()
         
         isRecording = false
         stopTimer()
+    }
+    
+    private func finishLandscapeWriter() {
+        landscapeQueue.async { [weak self] in
+            guard let self = self else { return }
+            
+            self.writerLock.lock()
+            
+            self.landscapeVideoInput?.markAsFinished()
+            self.landscapeAudioInput?.markAsFinished()
+            
+            guard let writer = self.landscapeWriter, writer.status == .writing else {
+                self.writerLock.unlock()
+                Task { @MainActor in
+                    self.landscapeFinished = true
+                    self.checkAndSaveRecordings()
+                }
+                return
+            }
+            
+            let url = self.landscapeURL
+            self.writerLock.unlock()
+            
+            writer.finishWriting {
+                print("✅ Finished landscape recording")
+                
+                // Log dimensions
+                if let url = url {
+                    let asset = AVAsset(url: url)
+                    Task {
+                        if let track = try? await asset.loadTracks(withMediaType: .video).first {
+                            let size = try? await track.load(.naturalSize)
+                            print("📐 Landscape actual size: \(size?.width ?? 0) x \(size?.height ?? 0)")
+                        }
+                    }
+                }
+                
+                Task { @MainActor in
+                    self.landscapeFinished = true
+                    self.checkAndSaveRecordings()
+                }
+            }
+            
+            // Cleanup
+            self.writerLock.lock()
+            self.landscapeWriter = nil
+            self.landscapeVideoInput = nil
+            self.landscapeAudioInput = nil
+            self.landscapePixelBufferAdaptor = nil
+            self.landscapeWritingStarted = false
+            self.landscapeSessionStartTime = nil
+            self.writerLock.unlock()
+        }
     }
     
     // MARK: - Timer
@@ -301,7 +446,12 @@ class MultiCamManager: NSObject, ObservableObject {
         if let url = portraitURL {
             saveToPhotos(url: url, name: "Portrait")
         }
-        if let url = landscapeURL {
+        
+        writerLock.lock()
+        let landscapeURLCopy = landscapeURL
+        writerLock.unlock()
+        
+        if let url = landscapeURLCopy {
             saveToPhotos(url: url, name: "Landscape")
         }
     }
@@ -325,56 +475,141 @@ class MultiCamManager: NSObject, ObservableObject {
     }
 }
 
-// MARK: - Recording Delegate
-extension MultiCamManager: AVCaptureFileOutputRecordingDelegate {
-    nonisolated func fileOutput(_ output: AVCaptureFileOutput, didStartRecordingTo fileURL: URL, from connections: [AVCaptureConnection]) {
-        print("🎬 Started recording: \(fileURL.lastPathComponent)")
-        for (i, conn) in connections.enumerated() {
-            let orientationName: String
-            switch conn.videoOrientation {
-            case .portrait: orientationName = "portrait"
-            case .portraitUpsideDown: orientationName = "portraitUpsideDown"
-            case .landscapeRight: orientationName = "landscapeRight"
-            case .landscapeLeft: orientationName = "landscapeLeft"
-            @unknown default: orientationName = "unknown(\(conn.videoOrientation.rawValue))"
-            }
-            print("   Connection \(i):")
-            print("   - Orientation: \(orientationName)")
-            print("   - Mirrored: \(conn.isVideoMirrored)")
-            for port in conn.inputPorts {
-                print("   - Port sourceDevice: \(port.sourceDeviceType?.rawValue ?? "nil")")
-            }
+// MARK: - Video/Audio Sample Buffer Delegate
+extension MultiCamManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
+    
+    nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        
+        let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        
+        if output is AVCaptureVideoDataOutput {
+            processLandscapeVideoFrame(sampleBuffer, timestamp: timestamp)
+        } else if output is AVCaptureAudioDataOutput {
+            processLandscapeAudioFrame(sampleBuffer, timestamp: timestamp)
         }
     }
     
-    nonisolated func fileOutput(_ output: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL, from connections: [AVCaptureConnection], error: Error?) {
-        let name = outputFileURL.lastPathComponent
+    /// Process ultra-wide camera frames: crop center to 16:9, rotate, write to landscape video
+    nonisolated private func processLandscapeVideoFrame(_ sampleBuffer: CMSampleBuffer, timestamp: CMTime) {
+        writerLock.lock()
+        defer { writerLock.unlock() }
         
-        if let error = error {
-            print("❌ Recording error for \(name): \(error.localizedDescription)")
-        } else {
-            print("✅ Finished recording: \(name)")
+        guard let writer = landscapeWriter,
+              let videoInput = landscapeVideoInput,
+              let adaptor = landscapePixelBufferAdaptor,
+              let context = ciContext,
+              let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            return
+        }
+        
+        // Start writer on first frame
+        if !landscapeWritingStarted {
+            landscapeWritingStarted = true
+            landscapeSessionStartTime = timestamp
+            writer.startWriting()
+            writer.startSession(atSourceTime: timestamp)
             
-            // Log actual video dimensions from the file
+            let w = CVPixelBufferGetWidth(imageBuffer)
+            let h = CVPixelBufferGetHeight(imageBuffer)
+            print("📐 Landscape source frame: \(w) x \(h) (portrait)")
+            print("📐 Will crop center to 16:9 and rotate to landscape")
+        }
+        
+        guard writer.status == .writing, videoInput.isReadyForMoreMediaData else { return }
+        
+        // Frame is portrait: e.g., 1080 x 1920 (width x height)
+        let frameWidth = CGFloat(CVPixelBufferGetWidth(imageBuffer))
+        let frameHeight = CGFloat(CVPixelBufferGetHeight(imageBuffer))
+        
+        // Crop a horizontal strip from center for 16:9 landscape content
+        // The strip width = frameWidth, strip height = frameWidth * 9/16
+        let cropHeight = frameWidth * 9.0 / 16.0
+        let cropY = (frameHeight - cropHeight) / 2.0
+        let cropRect = CGRect(x: 0, y: cropY, width: frameWidth, height: cropHeight)
+        
+        // Create CIImage, crop, and rotate
+        var ciImage = CIImage(cvPixelBuffer: imageBuffer)
+        
+        // Crop the center strip
+        ciImage = ciImage.cropped(to: cropRect)
+        
+        // Translate so crop rect origin is at (0,0)
+        ciImage = ciImage.transformed(by: CGAffineTransform(translationX: 0, y: -cropY))
+        
+        // Now we have a strip that's frameWidth x cropHeight (e.g., 1080 x 607.5)
+        // Rotate 90° clockwise to make it landscape (607.5 x 1080 becomes 1080 x 607.5... wait that's wrong)
+        
+        // Actually, let me think again:
+        // Portrait frame: 1080w x 1920h
+        // Crop center strip: 1080w x 607.5h
+        // To make landscape 16:9: we need to ROTATE the strip 90° AND scale to 1920x1080
+        
+        // Rotate 90° clockwise: (x,y) -> (y, width-x)
+        // After rotation, dimensions swap: 607.5w x 1080h
+        // Then scale to 1920x1080
+        
+        // Actually, simpler approach: rotate -90° (counterclockwise) 
+        // Then scale to fit 1920x1080
+        
+        let rotatedImage = ciImage
+            .transformed(by: CGAffineTransform(rotationAngle: -.pi / 2))
+            .transformed(by: CGAffineTransform(translationX: 0, y: frameWidth)) // fix negative coords after rotation
+        
+        // After rotation: dimensions are cropHeight x frameWidth = 607.5 x 1080
+        // Scale to 1920 x 1080
+        let scaleX = 1920.0 / cropHeight
+        let scaleY = 1080.0 / frameWidth
+        let scaledImage = rotatedImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+        
+        // Render to pixel buffer
+        guard let pixelBufferPool = adaptor.pixelBufferPool else { return }
+        var newPixelBuffer: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(nil, pixelBufferPool, &newPixelBuffer)
+        
+        guard let outputBuffer = newPixelBuffer else { return }
+        context.render(scaledImage, to: outputBuffer)
+        adaptor.append(outputBuffer, withPresentationTime: timestamp)
+    }
+    
+    nonisolated private func processLandscapeAudioFrame(_ sampleBuffer: CMSampleBuffer, timestamp: CMTime) {
+        writerLock.lock()
+        defer { writerLock.unlock() }
+        
+        guard landscapeWritingStarted,
+              let audioInput = landscapeAudioInput,
+              audioInput.isReadyForMoreMediaData else {
+            return
+        }
+        
+        audioInput.append(sampleBuffer)
+    }
+}
+
+// MARK: - Portrait Recording Delegate
+extension MultiCamManager: AVCaptureFileOutputRecordingDelegate {
+    nonisolated func fileOutput(_ output: AVCaptureFileOutput, didStartRecordingTo fileURL: URL, from connections: [AVCaptureConnection]) {
+        print("🎬 Portrait recording started: \(fileURL.lastPathComponent)")
+    }
+    
+    nonisolated func fileOutput(_ output: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL, from connections: [AVCaptureConnection], error: Error?) {
+        if let error = error {
+            print("❌ Portrait recording error: \(error.localizedDescription)")
+        } else {
+            print("✅ Portrait recording finished: \(outputFileURL.lastPathComponent)")
+            
+            // Log dimensions
             let asset = AVAsset(url: outputFileURL)
             Task {
                 if let track = try? await asset.loadTracks(withMediaType: .video).first {
                     let size = try? await track.load(.naturalSize)
-                    let transform = try? await track.load(.preferredTransform)
-                    print("📐 \(name) actual size: \(size?.width ?? 0) x \(size?.height ?? 0)")
-                    if let t = transform {
-                        print("📐 \(name) transform: a=\(t.a) b=\(t.b) c=\(t.c) d=\(t.d)")
-                    }
+                    print("📐 Portrait actual size: \(size?.width ?? 0) x \(size?.height ?? 0)")
                 }
             }
         }
         
         Task { @MainActor in
-            if outputFileURL.lastPathComponent.contains("portrait") {
-                self.portraitFinished = true
-            } else {
-                self.landscapeFinished = true
-            }
+            self.portraitFinished = true
             self.checkAndSaveRecordings()
         }
     }
